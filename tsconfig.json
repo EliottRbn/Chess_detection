@@ -3,14 +3,14 @@
   "compilerOptions": {
     "strict": true,
     "paths": {
-      "@/*": [
-        "./*"
-      ]
-    }
+      "@/*": ["./*"]
+    },
+    "typeRoots": ["./src/types", "./node_modules/@types"]
   },
   "include": [
-    "**/*.ts",
-    "**/*.tsx",
+    "app",
+    "src",
+    "src/types",
     ".expo/types/**/*.ts",
     "expo-env.d.ts"
   ]
