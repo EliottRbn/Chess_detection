@@ -2,9 +2,10 @@ import { useState, useRef, useCallback } from "react";
 import * as ort from "onnxruntime-react-native";
 import { loadOnnxModel } from "../src/utils/loadOnnxModel";
 import { preprocessImage } from "../src/utils/preprocessImage";
-import { postprocessPieces, type PieceDetection } from "../src/utils/postprocessPieces";
+import { postprocessPieces, type PieceDetection, type ClassPrediction } from "../src/utils/postprocessPieces";
 import { postprocessBoard } from "../src/utils/postprocessBoard";
 import { getPieceDisplay } from "../src/utils/pieceLabels";
+import { mapPiecesToBoard, boardToFEN, type BoardState } from "../src/utils/boardMapping";
 
 export type Detection = {
   bbox: [number, number, number, number];
@@ -15,13 +16,21 @@ export type Detection = {
   color?: string;
   polygon?: Array<{ x: number; y: number }>;
   class?: string;
+  predictions?: ClassPrediction[];
+};
+
+export type AnalysisResult = {
+  detections: Detection[];
+  boardState: BoardState | null;
+  boardPolygon: Array<{ x: number; y: number }> | null;
+  fen: string;
 };
 
 type ModelState = "idle" | "loading" | "ready" | "error";
 
 const INPUT_SIZE = 640;
 
-// Singleton sessions to avoid reloading models
+// Singleton sessions
 let piecesSession: ort.InferenceSession | null = null;
 let boardSession: ort.InferenceSession | null = null;
 let isLoadingModels = false;
@@ -79,24 +88,27 @@ export function useChessDetection() {
     }
   }, [modelState]);
 
-  const runInference = useCallback(async (
+  /**
+   * Run full analysis: board detection FIRST, then pieces
+   * Returns both raw detections and mapped board state
+   */
+  const runAnalysis = useCallback(async (
     imageUri: string,
-    options?: { detectBoard?: boolean; confidenceThreshold?: number }
-  ): Promise<Detection[]> => {
-    const { detectBoard = true, confidenceThreshold = 0.25 } = options ?? {};
+    options?: { confidenceThreshold?: number }
+  ): Promise<AnalysisResult> => {
+    const { confidenceThreshold = 0.25 } = options ?? {};
     
-    // Prevent concurrent inference
     if (processingRef.current) {
       console.log("Inference already in progress, skipping");
-      return [];
+      return { detections: [], boardState: null, boardPolygon: null, fen: "8/8/8/8/8/8/8/8" };
     }
     
     if (modelState !== "ready") {
       await loadModels();
     }
     
-    if (!piecesSession) {
-      throw new Error("Pieces model not loaded");
+    if (!piecesSession || !boardSession) {
+      throw new Error("Models not loaded");
     }
     
     processingRef.current = true;
@@ -107,12 +119,36 @@ export function useChessDetection() {
       const inputTensor = await preprocessImage(imageUri, INPUT_SIZE);
       const tensor = new ort.Tensor("float32", inputTensor, [1, 3, INPUT_SIZE, INPUT_SIZE]);
       
-      // Run pieces detection
+      // STEP 1: Detect BOARD first
+      console.log("Step 1: Detecting board...");
+      const outputsBoard = await boardSession.run({ images: tensor });
+      const boardDetection = postprocessBoard(outputsBoard);
+      
+      let boardPolygon: Array<{ x: number; y: number }> | null = null;
+      const detections: Detection[] = [];
+      
+      if (boardDetection) {
+        boardPolygon = boardDetection.polygon;
+        console.log("Board detected with", boardPolygon?.length, "corners");
+        
+        detections.push({
+          bbox: boardDetection.bbox as [number, number, number, number],
+          confidence: boardDetection.confidence,
+          class: "chessboard",
+          polygon: boardPolygon,
+          color: "#00FFFF",
+        });
+      } else {
+        console.warn("No board detected!");
+      }
+      
+      // STEP 2: Detect pieces
+      console.log("Step 2: Detecting pieces...");
       const outputsPieces = await piecesSession.run({ images: tensor });
       const pieceDetections = postprocessPieces(outputsPieces, confidenceThreshold);
       
-      // Format detections with labels
-      let detections: Detection[] = pieceDetections.map((det: PieceDetection) => {
+      // Format piece detections
+      const pieceResults: Detection[] = pieceDetections.map((det: PieceDetection) => {
         const display = getPieceDisplay(det.classId);
         return {
           bbox: det.bbox,
@@ -121,35 +157,43 @@ export function useChessDetection() {
           label: display.label,
           symbol: display.symbol,
           color: display.color,
+          predictions: det.predictions,
         };
       });
       
       // Apply smart post-processing (NMS + chess constraints)
       const { smartPostProcess } = await import("../src/utils/smartPostProcess");
-      detections = smartPostProcess(detections) as Detection[];
+      const processedPieces = smartPostProcess(pieceResults) as Detection[];
       
-      // Optionally detect board
-      if (detectBoard && boardSession) {
-        const outputsBoard = await boardSession.run({ images: tensor });
-        const boardDetection = postprocessBoard(outputsBoard);
-        
-        if (boardDetection) {
-          detections.push({
-            bbox: boardDetection.bbox as [number, number, number, number],
-            confidence: boardDetection.confidence,
-            class: "chessboard",
-            polygon: boardDetection.polygon,
-            color: "#00FFFF",
-          });
-        }
-      }
+      detections.push(...processedPieces);
+      console.log("Detected", processedPieces.length, "pieces");
       
-      return detections;
+      // STEP 3: Map pieces to board squares using perspective transform
+      console.log("Step 3: Mapping pieces to board...");
+      const boardState = mapPiecesToBoard(processedPieces, boardPolygon ?? undefined);
+      const fen = boardToFEN(boardState);
+      console.log("FEN:", fen);
+      
+      return {
+        detections,
+        boardState,
+        boardPolygon,
+        fen,
+      };
     } finally {
       processingRef.current = false;
       setIsProcessing(false);
     }
   }, [modelState, loadModels]);
+
+  // Legacy runInference for compatibility
+  const runInference = useCallback(async (
+    imageUri: string,
+    options?: { detectBoard?: boolean; confidenceThreshold?: number }
+  ): Promise<Detection[]> => {
+    const result = await runAnalysis(imageUri, options);
+    return result.detections;
+  }, [runAnalysis]);
 
   return {
     modelState,
@@ -157,6 +201,7 @@ export function useChessDetection() {
     error,
     loadModels,
     runInference,
+    runAnalysis,  // New method that returns full result
     inputSize: INPUT_SIZE,
   };
 }

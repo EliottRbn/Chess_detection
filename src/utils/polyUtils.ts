@@ -101,21 +101,77 @@ export function contourArea(contour: Point[]): number {
 }
 
 /**
- * Approximation naïve de polygone : échantillonnage
+ * Approximate polygon like cv2.approxPolyDP using Douglas–Peucker.
+ * contour : array of [x,y]
+ * epsilonRatio : ~0.01–0.02 is typical
  */
 export function approxPolyDP(contour: Point[], epsilonRatio = 0.02): Point[] {
-  const simplified: Point[] = [];
+  if (contour.length < 3) return contour;
 
-  const step = Math.max(1, Math.floor(contour.length * epsilonRatio));
+  const eps = epsilonRatio * contourPerimeter(contour);
 
-  for (let i = 0; i < contour.length; i += step) {
-    simplified.push(contour[i]);
+  function perpendicularDist(p: Point, a: Point, b: Point): number {
+    const [x, y] = p;
+    const [x1, y1] = a;
+    const [x2, y2] = b;
+
+    const num = Math.abs(
+      (y2 - y1) * x -
+      (x2 - x1) * y +
+      x2 * y1 -
+      y2 * x1
+    );
+
+    const den = Math.hypot(x2 - x1, y2 - y1);
+    return den === 0 ? 0 : num / den;
   }
 
-  // On veut 4 points max (forme plateau carré)
+  function dp(pts: Point[]): Point[] {
+    let maxDist = 0;
+    let index = 0;
+
+    for (let i = 1; i < pts.length - 1; i++) {
+      const d = perpendicularDist(pts[i], pts[0], pts[pts.length - 1]);
+      if (d > maxDist) {
+        maxDist = d;
+        index = i;
+      }
+    }
+
+    if (maxDist > eps) {
+      const left = dp(pts.slice(0, index + 1));
+      const right = dp(pts.slice(index));
+      return [...left.slice(0, -1), ...right];
+    }
+
+    return [pts[0], pts[pts.length - 1]];
+  }
+
+  const simplified = dp(contour);
+
+  // cv2.approxPolyDP tends to return 4 points for rectangles => enforce max 4
   if (simplified.length > 4) {
-    return simplified.slice(0, 4);
+    // keep 4 farthest points from centroid
+    const cx = simplified.reduce((s, p) => s + p[0], 0) / simplified.length;
+    const cy = simplified.reduce((s, p) => s + p[1], 0) / simplified.length;
+
+    return simplified
+      .sort((a, b) =>
+        Math.hypot(b[0] - cx, b[1] - cy) -
+        Math.hypot(a[0] - cx, a[1] - cy)
+      )
+      .slice(0, 4);
   }
 
   return simplified;
+}
+
+function contourPerimeter(pts: Point[]): number {
+  let p = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i];
+    const [x2, y2] = pts[(i + 1) % pts.length];
+    p += Math.hypot(x2 - x1, y2 - y1);
+  }
+  return p;
 }

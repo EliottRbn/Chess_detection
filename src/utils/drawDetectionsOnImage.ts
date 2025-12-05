@@ -1,4 +1,4 @@
-import { Skia, PaintStyle } from "@shopify/react-native-skia";
+import { Skia, PaintStyle, FontStyle } from "@shopify/react-native-skia";
 import * as FileSystem from "expo-file-system/legacy";
 import { encode as b64encode } from "base64-arraybuffer";
 
@@ -47,58 +47,95 @@ export async function drawDetectionsOnImage(
   );
 
   // 4) Draw detections
-  for (const det of detections) {
+  const paint = Skia.Paint();
+  paint.setStyle(PaintStyle.Stroke);
+  paint.setStrokeWidth(2);
+  
+  const textPaint = Skia.Paint();
+  textPaint.setColor(Skia.Color("#FFFFFF"));
+  
+  // Check for board polygon to draw grid
+  const boardDet = detections.find(d => d.class === "chessboard" && d.polygon);
+  if (boardDet && boardDet.polygon && boardDet.polygon.length >= 4) {
     try {
-      if (det.bbox) {
-        const [x1, y1, x2, y2] = det.bbox;
-        const color = det.color ?? "#FF0000";
+      const poly = boardDet.polygon;
+      const path = Skia.Path.Make();
+      path.moveTo(poly[0].x, poly[0].y);
+      for (let i = 1; i < poly.length; i++) {
+        path.lineTo(poly[i].x, poly[i].y);
+      }
+      path.close();
+      
+      const boardPaint = Skia.Paint();
+      boardPaint.setStyle(PaintStyle.Stroke);
+      boardPaint.setStrokeWidth(3);
+      boardPaint.setColor(Skia.Color("#00FFFF"));
+      canvas.drawPath(path, boardPaint);
+      
+      // Draw grid lines
+      const { computeBoardGrid } = require("./boardGridAnalysis");
+      const grid = computeBoardGrid(poly);
+      
+      if (grid) {
+        const gridPaint = Skia.Paint();
+        gridPaint.setStyle(PaintStyle.Stroke);
+        gridPaint.setStrokeWidth(1);
+        gridPaint.setColor(Skia.Color("rgba(0, 255, 255, 0.5)"));
         
-        // Draw bounding box
-        const rectPaint = Skia.Paint();
-        rectPaint.setColor(Skia.Color(color));
-        rectPaint.setStrokeWidth(3);
-        rectPaint.setStyle(PaintStyle.Stroke);
-        
-        canvas.drawRect(Skia.XYWHRect(x1, y1, x2 - x1, y2 - y1), rectPaint);
-        
-        // Draw label inside bbox (top-left corner)
-        if (det.label) {
-          const pieceType = det.label.split("-")[1]?.[0] ?? "?";
-          const isWhite = det.label.startsWith("white");
-          const labelText = isWhite ? pieceType.toUpperCase() : pieceType.toLowerCase();
-          
-          // Label background
-          const bgPaint = Skia.Paint();
-          bgPaint.setColor(Skia.Color(color));
-          bgPaint.setStyle(PaintStyle.Fill);
-          canvas.drawRect(Skia.XYWHRect(x1, y1, 20, 20), bgPaint);
-          
-          // Label text
-          const font = Skia.Font(undefined, 14);
-          const textPaint = Skia.Paint();
-          textPaint.setColor(Skia.Color("#FFFFFF"));
-          canvas.drawText(labelText, x1 + 5, y1 + 15, textPaint, font);
+        // Draw all 64 squares
+        for (let r = 0; r < 8; r++) {
+          for (let c = 0; c < 8; c++) {
+            const sq = grid.squares[r][c];
+            const sqPath = Skia.Path.Make();
+            sqPath.moveTo(sq.corners[0].x, sq.corners[0].y);
+            sqPath.lineTo(sq.corners[1].x, sq.corners[1].y);
+            sqPath.lineTo(sq.corners[2].x, sq.corners[2].y);
+            sqPath.lineTo(sq.corners[3].x, sq.corners[3].y);
+            sqPath.close();
+            canvas.drawPath(sqPath, gridPaint);
+          }
         }
       }
+    } catch (e) {
+      console.warn("Failed to draw grid:", e);
+    }
+  }
 
-      // Draw polygon for board
-      if (det.polygon && det.polygon.length > 0) {
-        const pts = det.polygon;
-        const path = Skia.Path.Make();
-        const polyPaint = Skia.Paint();
-        polyPaint.setColor(Skia.Color("#00FFFF"));
-        polyPaint.setStrokeWidth(4);
-        polyPaint.setStyle(PaintStyle.Stroke);
+  for (const det of detections) {
+    if (det.class === "chessboard") continue; // Already handled
+    
+    if (det.bbox) {
+      const [x1, y1, x2, y2] = det.bbox;
+      
+      // Check for NaN
+      if (isNaN(x1) || isNaN(y1) || isNaN(x2) || isNaN(y2)) continue;
 
-        path.moveTo(pts[0].x, pts[0].y);
-        for (let i = 1; i < pts.length; i++) {
-          path.lineTo(pts[i].x, pts[i].y);
-        }
-        path.close();
-        canvas.drawPath(path, polyPaint);
+      paint.setColor(Skia.Color(det.color || "#00FF00"));
+      canvas.drawRect({ x: x1, y: y1, width: x2 - x1, height: y2 - y1 }, paint);
+
+      if (det.label) {
+        // Draw label background
+        const fontMgr = Skia.FontMgr.System();
+        // matchFamilyStyle requires 2 args: familyName and style
+        // We can use default style or create one
+        const typeface = fontMgr.matchFamilyStyle("sans-serif", FontStyle.Normal);
+        if (!typeface) continue;
+        const font = Skia.Font(typeface, 14);
+        
+        const text = det.label;
+        const textWidth = font.getTextWidth(text);
+        const textHeight = 14;
+        
+        const bgPaint = Skia.Paint();
+        bgPaint.setColor(Skia.Color(det.color || "#00FF00"));
+        
+        canvas.drawRect(
+          { x: x1, y: y1 - textHeight - 4, width: textWidth + 8, height: textHeight + 4 },
+          bgPaint
+        );
+        
+        canvas.drawText(text, x1 + 4, y1 - 4, textPaint, font);
       }
-    } catch {
-      // Skip detection if drawing fails
     }
   }
 

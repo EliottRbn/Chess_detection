@@ -1,9 +1,16 @@
 import type * as ort from "onnxruntime-react-native";
 
+export type ClassPrediction = {
+  classId: number;
+  score: number;
+};
+
 export type PieceDetection = {
   bbox: [number, number, number, number];
   confidence: number;
   classId: number;
+  // Top 2 class predictions for fallback
+  predictions: ClassPrediction[];
 };
 
 /**
@@ -12,6 +19,8 @@ export type PieceDetection = {
  *  - 4 premiers = [x, y, w, h]
  *  - PAS d'objectness
  *  - 12 classes directement
+ * 
+ * Returns top 2 class predictions per detection for fallback logic
  */
 export function postprocessPieces(
   outputs: Record<string, ort.Tensor>,
@@ -40,16 +49,19 @@ export function postprocessPieces(
     const w = at(2, i);
     const h = at(3, i);
 
-    // Classes (12)
-    let bestCls = -1;
-    let bestScore = 0;
+    // Collect all class scores
+    const classScores: ClassPrediction[] = [];
     for (let c = 4; c < 16; c++) {
       const score = at(c, i);
-      if (score > bestScore) {
-        bestScore = score;
-        bestCls = c - 4;
-      }
+      classScores.push({ classId: c - 4, score });
     }
+
+    // Sort by score descending and take top 2
+    classScores.sort((a, b) => b.score - a.score);
+    const top2 = classScores.slice(0, 2);
+
+    const bestScore = top2[0].score;
+    const bestCls = top2[0].classId;
 
     if (bestScore < confThreshold) continue;
 
@@ -62,6 +74,7 @@ export function postprocessPieces(
       bbox: [x1, y1, x2, y2],
       confidence: bestScore,
       classId: bestCls,
+      predictions: top2,
     });
   }
 
