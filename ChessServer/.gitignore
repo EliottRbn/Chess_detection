@@ -1,0 +1,26 @@
+# System
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual Env
+venv/
+.env
+
+# Data & Models
+datasets/
+models/*.pt
+models/*.onnx
+models/*.bin
+!models/.gitkeep
+runs/
+src/runs/
+
+# Logs & Debug
+*.log
+debug_*.jpg
+output_*.jpg
+
+# Hugging Face
+.cache/

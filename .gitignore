@@ -1,0 +1,35 @@
+# === GLOBAL ===
+.DS_Store
+*.log
+.env
+.env*.local
+
+# === SERVER (Python/Chess) ===
+__pycache__/
+*.pyc
+*.pyo
+venv/
+ChessServer/datasets/
+ChessServer/models/*.pt
+ChessServer/models/*.onnx
+ChessServer/models/*.bin
+!ChessServer/models/.gitkeep
+ChessServer/runs/
+ChessServer/src/runs/
+debug_*.jpg
+output_*.jpg
+.cache/
+
+# === EXPO (React Native) ===
+node_modules/
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+.metro-health-check*
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.tsbuildinfo
+ChessExpo/ios/
+ChessExpo/android/
