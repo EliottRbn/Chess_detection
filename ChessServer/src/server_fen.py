@@ -44,9 +44,13 @@ if not MODEL_PATH:
 if not MODEL_PATH_2:
     for path in ["models/detect_pieces_1.onnx", "src/runs/detect_pieces_1.onnx", "runs/detect_pieces_1.onnx",
                  "models/detect_pieces_v2.onnx", "models/detect_pieces_v2.pt"]:
-        if os.path.exists(path):
+        if os.path.exists(path) and path != MODEL_PATH:
             MODEL_PATH_2 = path
             break
+
+# If paths are identical (e.g. resolved to same absolute path), disable secondary
+if MODEL_PATH and MODEL_PATH_2 and os.path.abspath(MODEL_PATH) == os.path.abspath(MODEL_PATH_2):
+    MODEL_PATH_2 = None
 
 if not BOARD_MODEL_PATH:
     for path in ["models/chessboard_detection.pt", "src/runs/chessboard_detection.pt", "runs/chessboard_detection.pt"]:

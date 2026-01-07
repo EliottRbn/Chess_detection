@@ -22,7 +22,7 @@ import { BoardState, PieceType, createEmptyBoard } from '../../src/types';
 import { parseFEN } from '../../src/utils/fenParser';
 import { saveToHistory } from './history';
 
-const SERVER_URL = 'http://192.168.1.63:7860';
+const SERVER_URL = 'https://raphalp-chess-fen-detection.hf.space';
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 // Piece images for selector
