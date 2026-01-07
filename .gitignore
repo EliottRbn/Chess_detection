@@ -33,3 +33,4 @@ yarn-error.*
 *.tsbuildinfo
 ChessExpo/ios/
 ChessExpo/android/
+ChessServer/assets/

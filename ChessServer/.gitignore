@@ -14,8 +14,10 @@ models/*.pt
 models/*.onnx
 models/*.bin
 !models/.gitkeep
-runs/
-src/runs/
+# runs/
+# src/runs/
+!src/runs/detect_pieces_1.onnx
+!src/runs/chessboard_detection.pt
 
 # Logs & Debug
 *.log
@@ -24,3 +26,6 @@ output_*.jpg
 
 # Hugging Face
 .cache/
+
+# Exclude assets for deployment
+assets/
