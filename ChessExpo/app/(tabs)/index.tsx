@@ -517,7 +517,7 @@ export default function ChessAnalyzerScreen() {
           <Text style={styles.permissionText}>
             L'application a besoin d'accéder à votre caméra pour analyser les positions d'échecs
           </Text>
-          <TouchableOpacity style={styles.primaryButton} onPress={requestPermission}>
+          <TouchableOpacity style={[styles.primaryButton, { flex: 0, width: '100%' }]} onPress={requestPermission}>
             <Text style={styles.primaryButtonText}>Autoriser l'accès</Text>
           </TouchableOpacity>
         </SafeAreaView>

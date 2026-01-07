@@ -34,3 +34,5 @@ yarn-error.*
 ChessExpo/ios/
 ChessExpo/android/
 ChessServer/assets/
+*.apk
+*.ipa
