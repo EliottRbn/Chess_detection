@@ -1,7 +1,7 @@
 import os
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, List
 from fastapi import FastAPI, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -620,51 +620,81 @@ def extract_grid_positions(pieces, board_corners):
     return grid_positions
 
 
-def merge_grid_positions(grid1: dict, grid2: dict) -> dict:
+def merge_multiple_grids(grids: list) -> dict:
     """
-    Merge two grid position dicts at the square level (row, col).
-    - If same piece at same square: boost confidence
-    - If different piece at same square: use higher confidence
-    - If piece only in one grid: keep it
+    Vote pondéré par case sur N grilles.
+    Pour chaque case, la pièce avec le score le plus élevé gagne.
+    Score = Σ confidences de chaque détection.
+    
+    Args:
+        grids: List of grid dicts [{(row,col): {'piece': 'P', 'class': 'white-pawn', 'confidence': 0.85}}]
+    
+    Returns:
+        Merged grid dict
     """
+    if not grids:
+        return {}
+    
+    if len(grids) == 1:
+        return grids[0]
+    
+    # Collecter tous les votes par case
+    votes = {}  # {(row,col): {'P': {'scores': [0.85, 0.75], 'class': 'white-pawn'}, ...}}
+    
+    for grid in grids:
+        for key, data in grid.items():
+            piece = data['piece']
+            conf = data['confidence']
+            piece_class = data.get('class', piece)
+            
+            if key not in votes:
+                votes[key] = {}
+            if piece not in votes[key]:
+                votes[key][piece] = {'scores': [], 'class': piece_class}
+            votes[key][piece]['scores'].append(conf)
+    
+    # Calculer scores et choisir gagnant par case
     merged = {}
-    all_keys = set(grid1.keys()) | set(grid2.keys())
+    print(f"[VoteMerge] Merging {len(grids)} grids...")
     
-    print(f"[GridMerge] Grid1: {len(grid1)} pieces, Grid2: {len(grid2)} pieces")
-    
-    for key in all_keys:
-        p1 = grid1.get(key)
-        p2 = grid2.get(key)
+    for (row, col), piece_votes in votes.items():
+        best_piece = None
+        best_score = 0
+        best_class = None
+        best_count = 0
         
-        row, col = key
         square = f"{chr(ord('a') + col)}{8 - row}"  # e.g., "e4"
         
-        if p1 and p2:
-            if p1['piece'] == p2['piece']:
-                # Same piece - boost confidence
-                boosted_conf = min(0.99, max(p1['confidence'], p2['confidence']) * 1.3)
-                merged[key] = {
-                    'piece': p1['piece'],
-                    'class': p1['class'],
-                    'confidence': boosted_conf
-                }
-                print(f"[GridMerge] ✓ {square}: {p1['class']} confirmed (conf: {boosted_conf:.2f})")
-            else:
-                # Different piece - use higher confidence
-                if p1['confidence'] >= p2['confidence']:
-                    merged[key] = p1
-                    print(f"[GridMerge] → {square}: {p1['class']} kept over {p2['class']}")
-                else:
-                    merged[key] = p2
-                    print(f"[GridMerge] ⚡ {square}: {p2['class']} replaced {p1['class']}")
-        elif p1:
-            merged[key] = p1
-            print(f"[GridMerge] • {square}: {p1['class']} from img1 only")
-        else:
-            merged[key] = p2
-            print(f"[GridMerge] + {square}: {p2['class']} from img2 only")
+        for piece, vote_data in piece_votes.items():
+            scores = vote_data['scores']
+            total_score = sum(scores)
+            
+            if total_score > best_score:
+                best_score = total_score
+                best_piece = piece
+                best_class = vote_data['class']
+                best_count = len(scores)
+        
+        # Normaliser la confiance par le nombre de grilles
+        normalized_conf = best_score / len(grids)
+        
+        merged[(row, col)] = {
+            'piece': best_piece,
+            'class': best_class,
+            'confidence': min(0.99, normalized_conf),
+            'vote_count': best_count,
+            'vote_ratio': best_count / len(grids)
+        }
+        
+        # Log détaillé pour les cas intéressants
+        if len(piece_votes) > 1:
+            # Conflit entre pièces
+            competitors = ", ".join([f"{p}({sum(v['scores']):.2f})" for p, v in piece_votes.items()])
+            print(f"[VoteMerge] ⚔ {square}: {best_class} won ({best_count}/{len(grids)} votes) vs [{competitors}]")
+        elif best_count == len(grids):
+            print(f"[VoteMerge] ✓ {square}: {best_class} unanimous ({best_count}/{len(grids)})")
     
-    print(f"[GridMerge] Result: {len(merged)} total pieces")
+    print(f"[VoteMerge] Result: {len(merged)} pieces from {len(grids)} grids")
     return merged
 
 
@@ -1021,6 +1051,41 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
         raise HTTPException(status_code=500, detail=f"Error processing image: {e}")
 
 
+@app.post("/calculate_move")
+async def calculate_move(fen: str = Query(...), turn: str = Query(default="w", pattern="^[wb]$")):
+    """
+    Recalculate best move for a given FEN position.
+    Used when user corrects pieces manually.
+    
+    Args:
+        fen: FEN string (just the piece placement, e.g. "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR")
+        turn: Whose turn - 'w' for white, 'b' for black
+    
+    Returns:
+        {"fen": str, "best_move": str}
+    """
+    try:
+        print(f"[Calculate] FEN: {fen}, Turn: {'White' if turn == 'w' else 'Black'}")
+        
+        # Get best move from Lichess/Stockfish
+        best_move = get_best_move(fen, turn)
+        
+        if best_move:
+            print(f"[Calculate] Best move: {best_move}")
+        else:
+            print("[Calculate] No best move found")
+        
+        return {
+            "fen": fen,
+            "best_move": best_move,
+            "turn": turn
+        }
+    
+    except Exception as e:
+        print(f"[Calculate] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error calculating move: {e}")
+
+
 @app.post("/detect_fen_verify")
 async def detect_fen_verify(file: UploadFile, session_id: str = Query(...)):
     """
@@ -1083,8 +1148,8 @@ async def detect_fen_verify(file: UploadFile, session_id: str = Query(...)):
         grid1 = {eval(k): v for k, v in grid1_raw.items()}
         print(f"[Verify] Image 1 grid: {len(grid1)} pieces from session")
         
-        # Merge at GRID level (a1-h8), not bbox level
-        merged_grid = merge_grid_positions(grid1, grid2)
+        # Merge using weighted voting (works for 2 or N grids)
+        merged_grid = merge_multiple_grids([grid1, grid2])
         
         # Convert merged grid to FEN
         fen = grid_to_fen(merged_grid)
@@ -1193,6 +1258,231 @@ def calculate_iou(box1: list, box2: list) -> float:
     union = area1 + area2 - intersection
     
     return intersection / union if union > 0 else 0
+
+
+def compute_frame_quality(img: np.ndarray) -> float:
+    """
+    Compute frame quality based on sharpness (Laplacian variance).
+    Higher values = sharper image.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return laplacian_var
+
+
+def extract_best_frames(video_bytes: bytes, max_frames: int = 15) -> List[np.ndarray]:
+    """
+    Extract the best frames from a video based on quality.
+    
+    Args:
+        video_bytes: Raw video bytes
+        max_frames: Maximum number of frames to return
+    
+    Returns:
+        List of RGB numpy arrays (best quality frames)
+    """
+    import tempfile
+    
+    # Save video to temp file
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+        tmp.write(video_bytes)
+        tmp_path = tmp.name
+    
+    try:
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            print("[Video] Failed to open video file")
+            return []
+        
+        # Get video info
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"[Video] Total frames: {total_frames}, FPS: {fps:.1f}")
+        
+        # Read all frames and compute quality
+        frames_with_quality = []
+        frame_idx = 0
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Convert to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Compute quality
+            quality = compute_frame_quality(frame_rgb)
+            frames_with_quality.append((frame_idx, quality, frame_rgb))
+            frame_idx += 1
+        
+        cap.release()
+        
+        if not frames_with_quality:
+            print("[Video] No frames extracted")
+            return []
+        
+        # Sort by quality (highest first)
+        frames_with_quality.sort(key=lambda x: x[1], reverse=True)
+        
+        # Take the best frames, but ensure diversity (not too close in time)
+        selected = []
+        selected_indices = set()
+        min_frame_gap = max(1, total_frames // (max_frames * 2))  # Minimum gap between selected frames
+        
+        for frame_idx, quality, frame in frames_with_quality:
+            if len(selected) >= max_frames:
+                break
+            
+            # Check if this frame is far enough from already selected ones
+            too_close = any(abs(frame_idx - idx) < min_frame_gap for idx in selected_indices)
+            if not too_close:
+                selected.append(frame)
+                selected_indices.add(frame_idx)
+        
+        print(f"[Video] Selected {len(selected)} frames (quality range: {frames_with_quality[-1][1]:.1f} - {frames_with_quality[0][1]:.1f})")
+        
+        return selected
+    
+    finally:
+        # Cleanup temp file
+        import os as os_module
+        try:
+            os_module.unlink(tmp_path)
+        except:
+            pass
+
+
+def detect_single_frame(img: np.ndarray) -> tuple:
+    """
+    Run detection on a single frame.
+    
+    Returns:
+        (pieces, board_corners) tuple
+    """
+    # Resize to model input size
+    img_resized = cv2.resize(img, (INPUT_SIZE, INPUT_SIZE))
+    
+    # Run detection
+    pieces = []
+    if USE_ENSEMBLE and ensemble_model:
+        ensemble_preds = ensemble_model.predict(img_resized, conf_threshold=0.25)
+        for pred in ensemble_preds:
+            x1, y1, x2, y2 = map(int, pred['bbox'])
+            pieces.append({
+                "class": pred['class_name'],
+                "confidence": pred['confidence'],
+                "bbox": [x1, y1, x2, y2]
+            })
+    else:
+        results = model.predict(img_resized, verbose=False, conf=0.25)
+        for result in results:
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                pieces.append({
+                    "class": CLASSES[cls_id],
+                    "confidence": conf,
+                    "bbox": [x1, y1, x2, y2]
+                })
+    
+    # Detect board
+    board_results = board_model.predict(img_resized, verbose=False)
+    board_corners = extract_board_polygon(board_results)
+    
+    return pieces, board_corners
+
+
+@app.post("/detect_fen_video")
+async def detect_fen_video(
+    file: UploadFile,
+    turn: str = Query(default="w", pattern="^[wb]$"),
+    max_frames: int = Query(default=15, ge=5, le=30)
+):
+    """
+    Detect FEN from a video using multi-frame weighted voting.
+    
+    1. Extract best frames from video (based on quality/sharpness)
+    2. Run detection independently on each frame
+    3. Merge using weighted voting per square
+    4. Apply validation and return final FEN
+    
+    Args:
+        file: Video file (mp4)
+        turn: 'w' or 'b' for who to move
+        max_frames: Number of frames to analyze (5-30, default 15)
+    """
+    try:
+        video_bytes = await file.read()
+        print(f"[VideoDetect] Received video: {len(video_bytes)} bytes, max_frames={max_frames}")
+        
+        # Extract best frames
+        frames = extract_best_frames(video_bytes, max_frames)
+        
+        if not frames:
+            raise HTTPException(status_code=400, detail="Could not extract frames from video")
+        
+        if len(frames) < 3:
+            raise HTTPException(status_code=400, detail=f"Only {len(frames)} frames extracted, need at least 3")
+        
+        # Run detection on each frame
+        grids = []
+        frames_with_board = 0
+        
+        for i, frame in enumerate(frames):
+            pieces, board_corners = detect_single_frame(frame)
+            
+            if board_corners is not None:
+                frames_with_board += 1
+                grid = extract_grid_positions(pieces, board_corners)
+                if grid:
+                    grids.append(grid)
+                    print(f"[VideoDetect] Frame {i+1}/{len(frames)}: {len(pieces)} pieces, {len(grid)} on grid")
+            else:
+                print(f"[VideoDetect] Frame {i+1}/{len(frames)}: No board detected, skipping")
+        
+        if not grids:
+            raise HTTPException(status_code=400, detail="No frames with valid board detection")
+        
+        print(f"[VideoDetect] Processing {len(grids)} valid grids from {len(frames)} frames")
+        
+        # Merge all grids using weighted voting
+        merged_grid = merge_multiple_grids(grids)
+        
+        # Convert to FEN with validation
+        fen = grid_to_fen(merged_grid)
+        print(f"[VideoDetect] Merged FEN: {fen}")
+        
+        # Get best move
+        best_move = get_best_move(fen, turn)
+        turn_name = "White" if turn == 'w' else "Black"
+        if best_move:
+            print(f"[VideoDetect] Best Move {turn_name}: {best_move}")
+        
+        # Calculate statistics
+        avg_confidence = sum(p['confidence'] for p in merged_grid.values()) / len(merged_grid) if merged_grid else 0
+        avg_vote_ratio = sum(p.get('vote_ratio', 1) for p in merged_grid.values()) / len(merged_grid) if merged_grid else 0
+        
+        return {
+            "fen": fen,
+            "pieces_count": len(merged_grid),
+            "best_move": best_move,
+            "detection_mode": "video_multi_frame",
+            "frames_analyzed": len(frames),
+            "frames_with_board": frames_with_board,
+            "grids_merged": len(grids),
+            "avg_confidence": round(avg_confidence, 3),
+            "avg_vote_ratio": round(avg_vote_ratio, 3),
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[VideoDetect] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Video detection error: {e}")
 
 
 if __name__ == "__main__":

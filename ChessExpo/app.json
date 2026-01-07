@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "chess-vision",
-    "slug": "chess-vision",
+    "name": "ChessCam 360",
+    "slug": "chesscam-360",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -15,7 +15,9 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.gymbro.chessvision",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSPhotoLibraryUsageDescription": "Cette application accède à votre galerie pour sélectionner des photos ou vidéos de l'échiquier.",
+        "NSMicrophoneUsageDescription": "Cette application utilise le microphone pour l'enregistrement vidéo."
       }
     },
     "android": {
@@ -41,6 +43,12 @@
         "expo-camera",
         {
           "cameraPermission": "Cette application utilise la caméra pour détecter les pièces d'échecs en temps réel."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Cette application accède à votre galerie pour sélectionner des photos ou vidéos de l'échiquier."
         }
       ],
       [

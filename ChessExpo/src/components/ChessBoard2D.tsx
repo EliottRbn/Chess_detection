@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, StyleSheet, Image } from 'react-native';
+import { View, Text, StyleSheet, Image, TouchableOpacity } from 'react-native';
 import Svg, { Line, Polygon } from 'react-native-svg';
 import { BoardState, PieceType } from '../types';
 
@@ -8,6 +8,8 @@ interface ChessBoard2DProps {
   size?: number;
   highlightFrom?: string;
   highlightTo?: string;
+  onSquarePress?: (square: string) => void;  // For piece editing
+  selectedSquare?: string | null;  // Currently selected square
 }
 
 const LIGHT_SQUARE = '#F0D9B5';
@@ -45,11 +47,14 @@ export function ChessBoard2D({
   size = 320,
   highlightFrom,
   highlightTo,
+  onSquarePress,
+  selectedSquare,
 }: ChessBoard2DProps) {
   const squareSize = size / 8;
   
   const fromSquare = parseSquare(highlightFrom || '');
   const toSquare = parseSquare(highlightTo || '');
+  const selectedPos = parseSquare(selectedSquare || '');
 
   const renderPiece = (piece: PieceType, squareSize: number) => {
     if (!piece) return null;
@@ -73,13 +78,54 @@ export function ChessBoard2D({
     const piece = boardState[row][col];
     const file = String.fromCharCode(97 + col);
     const rank = 8 - row;
+    const squareNotation = `${file}${rank}`;
     
     const isFromSquare = fromSquare && fromSquare.row === row && fromSquare.col === col;
     const isToSquare = toSquare && toSquare.row === row && toSquare.col === col;
+    const isSelected = selectedPos && selectedPos.row === row && selectedPos.col === col;
     
     let backgroundColor = isLight ? LIGHT_SQUARE : DARK_SQUARE;
     if (isFromSquare) backgroundColor = HIGHLIGHT_FROM;
     if (isToSquare) backgroundColor = HIGHLIGHT_TO;
+    if (isSelected) backgroundColor = 'rgba(99, 102, 241, 0.7)'; // Purple for selection
+
+    const squareContent = (
+      <>
+        {renderPiece(piece, squareSize)}
+        
+        {row === 7 && (
+          <Text style={[styles.fileLabel, { color: isLight ? DARK_SQUARE : LIGHT_SQUARE }]}>
+            {file}
+          </Text>
+        )}
+        {col === 0 && (
+          <Text style={[styles.rankLabel, { color: isLight ? DARK_SQUARE : LIGHT_SQUARE }]}>
+            {rank}
+          </Text>
+        )}
+      </>
+    );
+
+    // If clickable, wrap in TouchableOpacity
+    if (onSquarePress) {
+      return (
+        <TouchableOpacity
+          key={`${row}-${col}`}
+          activeOpacity={0.7}
+          onPress={() => onSquarePress(squareNotation)}
+          style={[
+            styles.square,
+            {
+              width: squareSize,
+              height: squareSize,
+              backgroundColor,
+            },
+          ]}
+        >
+          {squareContent}
+        </TouchableOpacity>
+      );
+    }
 
     return (
       <View
@@ -93,18 +139,7 @@ export function ChessBoard2D({
           },
         ]}
       >
-        {renderPiece(piece, squareSize)}
-        
-        {row === 7 && (
-          <Text style={[styles.fileLabel, { color: isLight ? DARK_SQUARE : LIGHT_SQUARE }]}>
-            {file}
-          </Text>
-        )}
-        {col === 0 && (
-          <Text style={[styles.rankLabel, { color: isLight ? DARK_SQUARE : LIGHT_SQUARE }]}>
-            {rank}
-          </Text>
-        )}
+        {squareContent}
       </View>
     );
   };

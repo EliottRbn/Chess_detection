@@ -18,14 +18,31 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ChessBoard2D } from '../../src/components/ChessBoard2D';
-import { BoardState, createEmptyBoard } from '../../src/types';
+import { BoardState, PieceType, createEmptyBoard } from '../../src/types';
 import { parseFEN } from '../../src/utils/fenParser';
 import { saveToHistory } from './history';
 
 const SERVER_URL = 'http://192.168.1.63:7860';
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
-type AppState = 'camera' | 'preview' | 'analyzing' | 'result' | 'verification_needed';
+// Piece images for selector
+const PIECE_IMAGES: Record<string, any> = {
+  'K': require('../../assets/pieces/white_king.png'),
+  'Q': require('../../assets/pieces/white_queen.png'),
+  'R': require('../../assets/pieces/white_rook.png'),
+  'B': require('../../assets/pieces/white_bishop.png'),
+  'N': require('../../assets/pieces/white_knight.png'),
+  'P': require('../../assets/pieces/white_pawn.png'),
+  'k': require('../../assets/pieces/black_king.png'),
+  'q': require('../../assets/pieces/black_queen.png'),
+  'r': require('../../assets/pieces/black_rook.png'),
+  'b': require('../../assets/pieces/black_bishop.png'),
+  'n': require('../../assets/pieces/black_knight.png'),
+  'p': require('../../assets/pieces/black_pawn.png'),
+};
+
+type AppState = 'camera' | 'preview' | 'analyzing' | 'result' | 'verification_needed' | 'recording';
+type CaptureMode = 'photo' | 'video';
 
 export default function ChessAnalyzerScreen() {
   const [state, setState] = useState<AppState>('camera');
@@ -42,6 +59,20 @@ export default function ChessAnalyzerScreen() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [verificationReason, setVerificationReason] = useState<string>('');
   const [confidenceInfo, setConfidenceInfo] = useState<{avg: number, min: number, lowCount: number} | null>(null);
+
+  // Video mode state
+  const [captureMode, setCaptureMode] = useState<CaptureMode>('photo');
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const VIDEO_MAX_DURATION = 5; // 5 seconds
+
+  // Piece correction state
+  const [showBestMove, setShowBestMove] = useState(false);  // Hide best move until user validates
+  const [selectedSquare, setSelectedSquare] = useState<string | null>(null);  // e.g. "e4"
+  const [hasChanges, setHasChanges] = useState(false);  // Track if user modified pieces
+  const [showPieceSelector, setShowPieceSelector] = useState(false);
+  const [isRecalculating, setIsRecalculating] = useState(false);
 
   const takePhoto = async () => {
     if (!cameraRef.current) return;
@@ -70,6 +101,128 @@ export default function ChessAnalyzerScreen() {
       }
     } catch (error) {
       Alert.alert('Erreur', 'Impossible de charger l\'image');
+    }
+  };
+
+  // Video recording functions
+  const startRecording = async () => {
+    if (!cameraRef.current) return;
+    try {
+      setIsRecording(true);
+      setState('recording');
+      setRecordingTime(0);
+      
+      // Start timer
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingTime(prev => {
+          if (prev >= VIDEO_MAX_DURATION - 1) {
+            stopRecording();
+            return prev;
+          }
+          return prev + 1;
+        });
+      }, 1000);
+      
+      const video = await cameraRef.current.recordAsync({
+        maxDuration: VIDEO_MAX_DURATION,
+      });
+      
+      if (video?.uri) {
+        analyzeVideo(video.uri);
+      }
+    } catch (error) {
+      console.error('Recording error:', error);
+      Alert.alert('Erreur', 'Impossible d\'enregistrer la vidéo');
+      setIsRecording(false);
+      setState('camera');
+    }
+  };
+
+  const stopRecording = async () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    setIsRecording(false);
+    
+    if (cameraRef.current) {
+      cameraRef.current.stopRecording();
+    }
+  };
+
+  const analyzeVideo = async (videoUri: string) => {
+    setState('analyzing');
+    
+    try {
+      const formData = new FormData();
+      formData.append('file', {
+        uri: videoUri,
+        name: 'video.mp4',
+        type: 'video/mp4',
+      } as any);
+
+      const turn = isWhiteTurn ? 'w' : 'b';
+      const response = await fetch(`${SERVER_URL}/detect_fen_video?turn=${turn}&max_frames=15`, {
+        method: 'POST',
+        body: formData,
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+
+      if (!response.ok) throw new Error(`Erreur serveur: ${response.status}`);
+
+      const data = await response.json();
+
+      if (data.fen) {
+        const newBoardState = parseFEN(data.fen);
+        setBoardState(newBoardState);
+        setBestMove(data.best_move || null);
+        setFen(data.fen);
+        setState('result');
+        
+        // Save to history
+        saveToHistory({
+          fen: data.fen,
+          bestMove: data.best_move || null,
+          turn: turn as 'w' | 'b',
+        });
+      } else {
+        throw new Error('Aucune position détectée');
+      }
+    } catch (error) {
+      Alert.alert('Erreur', (error as Error).message);
+      setState('camera');
+    }
+  };
+
+  const pickVideoFromGallery = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['videos'],
+        quality: 0.8,
+      });
+      
+      if (!result.canceled && result.assets[0]) {
+        const video = result.assets[0];
+        console.log('[Video] Selected video:', video.uri, 'duration:', video.duration);
+        
+        // Duration is in milliseconds in expo-image-picker
+        const durationSeconds = video.duration ? video.duration / 1000 : 0;
+        console.log('[Video] Duration in seconds:', durationSeconds);
+        
+        if (durationSeconds > VIDEO_MAX_DURATION) {
+          Alert.alert(
+            'Vidéo trop longue',
+            `Veuillez sélectionner une vidéo de ${VIDEO_MAX_DURATION} secondes maximum. (Durée: ${Math.round(durationSeconds)}s)`,
+            [{ text: 'OK' }]
+          );
+          return;
+        }
+        
+        analyzeVideo(video.uri);
+      }
+    } catch (error) {
+      console.error('[Video] Gallery error:', error);
+      Alert.alert('Erreur', 'Impossible de charger la vidéo');
     }
   };
 
@@ -241,7 +394,105 @@ export default function ChessAnalyzerScreen() {
     setSessionId(null);
     setVerificationReason('');
     setConfidenceInfo(null);
+    setShowBestMove(false);
+    setSelectedSquare(null);
+    setHasChanges(false);
+    setShowPieceSelector(false);
     setState('camera');
+  };
+
+  // Piece correction functions
+  const handleSquarePress = (square: string) => {
+    setSelectedSquare(square);
+    setShowPieceSelector(true);
+  };
+
+  const handlePieceSelect = (piece: PieceType) => {
+    if (!selectedSquare) return;
+    
+    // Convert square notation (e.g. "e4") to row/col
+    const col = selectedSquare.charCodeAt(0) - 'a'.charCodeAt(0);
+    const row = 8 - parseInt(selectedSquare[1]);
+    
+    // Update board state
+    const newBoard: BoardState = boardState.map((r, ri) => 
+      r.map((cell, ci) => {
+        if (ri === row && ci === col) {
+          return piece;
+        }
+        return cell;
+      })
+    );
+    
+    setBoardState(newBoard);
+    setHasChanges(true);
+    setShowPieceSelector(false);
+    setSelectedSquare(null);
+    
+    // Update FEN string
+    const newFen = boardToFEN(newBoard);
+    setFen(newFen);
+  };
+
+  const boardToFEN = (board: BoardState): string => {
+    const rows = board.map(row => {
+      let fenRow = '';
+      let emptyCount = 0;
+      
+      for (const cell of row) {
+        if (cell === null) {
+          emptyCount++;
+        } else {
+          if (emptyCount > 0) {
+            fenRow += emptyCount;
+            emptyCount = 0;
+          }
+          fenRow += cell;
+        }
+      }
+      
+      if (emptyCount > 0) {
+        fenRow += emptyCount;
+      }
+      
+      return fenRow;
+    });
+    
+    return rows.join('/');
+  };
+
+  const handleValidate = async () => {
+    if (hasChanges) {
+      // Need to recalculate best move
+      setIsRecalculating(true);
+      try {
+        const turn = isWhiteTurn ? 'w' : 'b';
+        const response = await fetch(
+          `${SERVER_URL}/calculate_move?fen=${encodeURIComponent(fen)}&turn=${turn}`,
+          { method: 'POST' }
+        );
+        
+        if (!response.ok) throw new Error('Erreur serveur');
+        
+        const data = await response.json();
+        setBestMove(data.best_move || null);
+      } catch (error) {
+        console.error('Recalculate error:', error);
+        // Still show board, just without move
+      }
+      setIsRecalculating(false);
+    }
+    
+    // Show best move
+    setShowBestMove(true);
+    
+    // Save to history
+    const turn = isWhiteTurn ? 'w' : 'b';
+    saveToHistory({
+      fen: fen,
+      bestMove: bestMove || null,
+      turn: turn as 'w' | 'b',
+    });
   };
 
   const parseBestMove = (move: string | null) => {
@@ -282,7 +533,7 @@ export default function ChessAnalyzerScreen() {
         
         {/* Header */}
         <View style={styles.header}>
-          <Text style={styles.headerTitle}>♟️ Chess Vision</Text>
+          <Image source={require('../../assets/logoapp.png')} style={styles.headerLogo} resizeMode="contain" />
           {state !== 'camera' && (
             <TouchableOpacity onPress={reset} style={styles.headerButton}>
               <Ionicons name="close" size={24} color="#fff" />
@@ -291,9 +542,38 @@ export default function ChessAnalyzerScreen() {
         </View>
 
         {/* Camera View */}
-        {state === 'camera' && (
+        {(state === 'camera' || state === 'recording') && (
           <View style={styles.cameraWrapper}>
-            <CameraView ref={cameraRef} style={styles.camera} facing="back">
+            {/* Mode Selector */}
+            <View style={styles.modeSelector}>
+              <TouchableOpacity 
+                style={[styles.modeButton, captureMode === 'photo' && styles.modeButtonActive]}
+                onPress={() => setCaptureMode('photo')}
+                disabled={isRecording}
+              >
+                <Ionicons name="camera" size={20} color={captureMode === 'photo' ? '#fff' : '#9ca3af'} />
+                <Text style={[styles.modeButtonText, captureMode === 'photo' && styles.modeButtonTextActive]}>
+                  Photo
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                style={[styles.modeButton, captureMode === 'video' && styles.modeButtonActive]}
+                onPress={() => setCaptureMode('video')}
+                disabled={isRecording}
+              >
+                <Ionicons name="videocam" size={20} color={captureMode === 'video' ? '#fff' : '#9ca3af'} />
+                <Text style={[styles.modeButtonText, captureMode === 'video' && styles.modeButtonTextActive]}>
+                  Vidéo
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            <CameraView 
+              ref={cameraRef} 
+              style={styles.camera} 
+              facing="back"
+              mode={captureMode === 'video' ? 'video' : 'picture'}
+            >
               <View style={styles.cameraOverlay}>
                 <View style={styles.scanFrame}>
                   <View style={[styles.corner, styles.cornerTL]} />
@@ -301,19 +581,50 @@ export default function ChessAnalyzerScreen() {
                   <View style={[styles.corner, styles.cornerBL]} />
                   <View style={[styles.corner, styles.cornerBR]} />
                 </View>
-                <Text style={styles.scanHint}>Cadrez l'échiquier</Text>
+                {isRecording ? (
+                  <View style={styles.recordingIndicator}>
+                    <View style={styles.recordingDot} />
+                    <Text style={styles.recordingText}>
+                      {recordingTime}s / {VIDEO_MAX_DURATION}s
+                    </Text>
+                  </View>
+                ) : (
+                  <Text style={styles.scanHint}>
+                    {captureMode === 'photo' ? 'Cadrez l\'échiquier' : 'Filmez l\'échiquier (5s)'}
+                  </Text>
+                )}
               </View>
             </CameraView>
             
             <View style={styles.cameraControls}>
-              <TouchableOpacity style={styles.iconButton} onPress={pickFromGallery}>
-                <Ionicons name="images" size={26} color="#fff" />
+              {/* Gallery button - left side for both modes */}
+              <TouchableOpacity 
+                style={styles.iconButton} 
+                onPress={captureMode === 'photo' ? pickFromGallery : pickVideoFromGallery}
+                disabled={isRecording}
+              >
+                <Ionicons name="images" size={26} color={isRecording ? '#4b5563' : '#fff'} />
               </TouchableOpacity>
               
-              <TouchableOpacity style={styles.captureButton} onPress={takePhoto}>
-                <View style={styles.captureInner} />
-              </TouchableOpacity>
+              {/* Capture button - center */}
+              {captureMode === 'photo' ? (
+                <TouchableOpacity style={styles.captureButton} onPress={takePhoto}>
+                  <View style={styles.captureInner} />
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity 
+                  style={[styles.captureButton, isRecording && styles.recordingButton]} 
+                  onPress={isRecording ? stopRecording : startRecording}
+                >
+                  {isRecording ? (
+                    <View style={styles.stopRecordingInner} />
+                  ) : (
+                    <View style={styles.videoInner} />
+                  )}
+                </TouchableOpacity>
+              )}
               
+              {/* Placeholder - right side */}
               <View style={styles.iconButtonPlaceholder} />
             </View>
           </View>
@@ -413,41 +724,151 @@ export default function ChessAnalyzerScreen() {
         {/* Result */}
         {state === 'result' && (
           <ScrollView contentContainerStyle={styles.scrollContent}>
+            {/* Board - clickable before validation */}
             <View style={styles.boardCard}>
-              <ChessBoard2D 
-                boardState={boardState} 
-                size={SCREEN_WIDTH - 60} 
-                highlightFrom={moveData?.from}
-                highlightTo={moveData?.to}
-              />
+              {!showBestMove ? (
+                // Editable mode - render clickable squares
+                <View style={{ position: 'relative' }}>
+                  <ChessBoard2D 
+                    boardState={boardState} 
+                    size={SCREEN_WIDTH - 60}
+                    onSquarePress={handleSquarePress}
+                    selectedSquare={selectedSquare}
+                  />
+                  <Text style={styles.editHint}>
+                    Touchez une case pour corriger une pièce
+                  </Text>
+                </View>
+              ) : (
+                // Validated - show with best move highlight
+                <ChessBoard2D 
+                  boardState={boardState} 
+                  size={SCREEN_WIDTH - 60} 
+                  highlightFrom={moveData?.from}
+                  highlightTo={moveData?.to}
+                />
+              )}
             </View>
 
-            {bestMove ? (
-              <View style={styles.moveCard}>
-                <View style={styles.moveHeader}>
-                  <Ionicons name="bulb" size={24} color="#fbbf24" />
-                  <Text style={styles.moveTitle}>Meilleur coup</Text>
+            {/* Best move - only shown after validation */}
+            {showBestMove && (
+              bestMove ? (
+                <View style={styles.moveCard}>
+                  <View style={styles.moveHeader}>
+                    <Ionicons name="bulb" size={24} color="#fbbf24" />
+                    <Text style={styles.moveTitle}>Meilleur coup</Text>
+                  </View>
+                  <Text style={styles.moveText}>
+                    {moveData?.from?.toUpperCase()} → {moveData?.to?.toUpperCase()}
+                  </Text>
                 </View>
-                <Text style={styles.moveText}>
-                  {moveData?.from?.toUpperCase()} → {moveData?.to?.toUpperCase()}
-                </Text>
-              </View>
-            ) : (
-              <View style={styles.noMoveCard}>
-                <Ionicons name="information-circle" size={20} color="#9ca3af" />
-                <Text style={styles.noMoveText}>Aucun coup suggéré</Text>
-              </View>
+              ) : (
+                <View style={styles.noMoveCard}>
+                  <Ionicons name="information-circle" size={20} color="#9ca3af" />
+                  <Text style={styles.noMoveText}>Aucun coup suggéré</Text>
+                </View>
+              )
             )}
 
-            <View style={styles.fenCard}>
-              <Text style={styles.fenLabel}>Position FEN</Text>
-              <Text style={styles.fenText}>{fen}</Text>
-            </View>
+            {/* Validate button - before validation */}
+            {!showBestMove && (
+              <TouchableOpacity 
+                style={[styles.primaryButton, hasChanges && styles.warningButton]} 
+                onPress={handleValidate}
+                disabled={isRecalculating}
+              >
+                {isRecalculating ? (
+                  <ActivityIndicator size="small" color="#fff" style={{ marginRight: 8 }} />
+                ) : (
+                  <Ionicons 
+                    name={hasChanges ? "refresh" : "checkmark-circle"} 
+                    size={18} 
+                    color="#fff" 
+                    style={{ marginRight: 8 }} 
+                  />
+                )}
+                <Text style={styles.primaryButtonText}>
+                  {isRecalculating ? 'Recalcul...' : hasChanges ? 'Recalculer et Valider' : 'Valider la position'}
+                </Text>
+              </TouchableOpacity>
+            )}
 
-            <TouchableOpacity style={styles.primaryButton} onPress={reset}>
-              <Ionicons name="camera" size={18} color="#fff" style={{ marginRight: 8 }} />
-              <Text style={styles.primaryButtonText}>Nouvelle analyse</Text>
-            </TouchableOpacity>
+            {/* FEN and New analysis - after validation */}
+            {showBestMove && (
+              <>
+                <View style={styles.fenCard}>
+                  <Text style={styles.fenLabel}>Position FEN</Text>
+                  <Text style={styles.fenText}>{fen}</Text>
+                </View>
+
+                <TouchableOpacity style={styles.primaryButton} onPress={reset}>
+                  <Ionicons name="camera" size={18} color="#fff" style={{ marginRight: 8 }} />
+                  <Text style={styles.primaryButtonText}>Nouvelle analyse</Text>
+                </TouchableOpacity>
+              </>
+            )}
+
+            {/* Piece Selector Modal */}
+            {showPieceSelector && selectedSquare && (
+              <View style={styles.pieceSelectorOverlay}>
+                <View style={styles.pieceSelector}>
+                  <Text style={styles.pieceSelectorTitle}>
+                    Pièce sur {selectedSquare.toUpperCase()}
+                  </Text>
+                  
+                  {/* Empty */}
+                  <TouchableOpacity 
+                    style={styles.pieceOption} 
+                    onPress={() => handlePieceSelect(null)}
+                  >
+                    <Text style={styles.pieceOptionText}>Vide</Text>
+                  </TouchableOpacity>
+                  
+                  {/* White pieces */}
+                  <Text style={styles.pieceSectionLabel}>Blancs</Text>
+                  <View style={styles.pieceRow}>
+                    {(['K', 'Q', 'R', 'B', 'N', 'P'] as PieceType[]).map(piece => (
+                      <TouchableOpacity 
+                        key={piece} 
+                        style={styles.pieceButton}
+                        onPress={() => handlePieceSelect(piece)}
+                      >
+                        <Image 
+                          source={PIECE_IMAGES[piece!]} 
+                          style={styles.pieceImage} 
+                          resizeMode="contain"
+                        />
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  
+                  {/* Black pieces */}
+                  <Text style={styles.pieceSectionLabel}>Noirs</Text>
+                  <View style={styles.pieceRow}>
+                    {(['k', 'q', 'r', 'b', 'n', 'p'] as PieceType[]).map(piece => (
+                      <TouchableOpacity 
+                        key={piece} 
+                        style={styles.pieceButton}
+                        onPress={() => handlePieceSelect(piece)}
+                      >
+                        <Image 
+                          source={PIECE_IMAGES[piece!]} 
+                          style={styles.pieceImage} 
+                          resizeMode="contain"
+                        />
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  
+                  <TouchableOpacity 
+                    style={styles.cancelButton} 
+                    onPress={() => { setShowPieceSelector(false); setSelectedSquare(null); }}
+                  >
+                    <Text style={styles.cancelButtonText}>Annuler</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
           </ScrollView>
         )}
       </SafeAreaView>
@@ -466,12 +887,25 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
+    justifyContent: 'center',
     paddingHorizontal: 20,
-    paddingVertical: 15,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.1)',
+    position: 'relative',
+    height: 60,
   },
-  headerTitle: { fontSize: 22, fontWeight: '700', color: '#fff' },
-  headerButton: { padding: 8 },
+  headerLogo: {
+    width: 160,
+    height: 400,
+  },
+  headerButton: { 
+    padding: 8,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderRadius: 20,
+    position: 'absolute',
+    right: 20,
+  },
 
   // Permission
   permissionTitle: { fontSize: 24, fontWeight: '700', color: '#fff', marginTop: 20 },
@@ -628,5 +1062,167 @@ const styles = StyleSheet.create({
     paddingHorizontal: 30,
     paddingVertical: 25,
     backgroundColor: 'rgba(26,26,46,0.95)',
+  },
+
+  // Mode Selector
+  modeSelector: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    backgroundColor: 'rgba(26,26,46,0.98)',
+    gap: 12,
+  },
+  modeButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 30,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    gap: 8,
+  },
+  modeButtonActive: {
+    backgroundColor: '#6366f1',
+    borderColor: '#6366f1',
+    shadowColor: '#6366f1',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 5,
+  },
+  modeButtonText: {
+    color: '#9ca3af',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  modeButtonTextActive: {
+    color: '#fff',
+  },
+
+  // Recording
+  recordingIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 20,
+    gap: 8,
+  },
+  recordingDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#ef4444',
+  },
+  recordingText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  recordingButton: {
+    borderColor: '#ef4444',
+    borderWidth: 3,
+  },
+  stopRecordingInner: {
+    width: 30,
+    height: 30,
+    backgroundColor: '#ef4444',
+    borderRadius: 4,
+  },
+  videoInner: {
+    width: 62,
+    height: 62,
+    borderRadius: 31,
+    backgroundColor: '#ef4444',
+  },
+
+  // Piece Correction
+  editHint: {
+    color: '#9ca3af',
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 10,
+  },
+  warningButton: {
+    backgroundColor: '#f59e0b',
+  },
+  pieceSelectorOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 100,
+  },
+  pieceSelector: {
+    backgroundColor: '#1a1a2e',
+    borderRadius: 20,
+    padding: 24,
+    width: '85%',
+    maxWidth: 340,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  pieceSelectorTitle: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '600',
+    marginBottom: 20,
+  },
+  pieceOption: {
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    paddingVertical: 12,
+    paddingHorizontal: 30,
+    borderRadius: 10,
+    marginBottom: 15,
+    width: '100%',
+    alignItems: 'center',
+  },
+  pieceOptionText: {
+    color: '#9ca3af',
+    fontSize: 16,
+  },
+  pieceSectionLabel: {
+    color: '#9ca3af',
+    fontSize: 12,
+    fontWeight: '500',
+    marginBottom: 8,
+    marginTop: 5,
+    alignSelf: 'flex-start',
+  },
+  pieceRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 8,
+    marginBottom: 15,
+  },
+  pieceButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 10,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  pieceImage: {
+    width: 36,
+    height: 36,
+  },
+  pieceSymbol: {
+    fontSize: 28,
+  },
+  cancelButton: {
+    marginTop: 10,
+    paddingVertical: 12,
+  },
+  cancelButtonText: {
+    color: '#ef4444',
+    fontSize: 16,
+    fontWeight: '500',
   },
 });
