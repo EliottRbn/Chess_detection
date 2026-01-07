@@ -1,4 +1,7 @@
 import os
+import uuid
+from datetime import datetime, timedelta
+from typing import Dict, Any
 from fastapi import FastAPI, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -7,6 +10,13 @@ import cv2
 from ultralytics import YOLO
 import torch
 import requests
+
+# Session storage for multi-photo verification (in-memory, clears on restart)
+# Structure: {session_id: {pieces: [...], board_corners: ..., timestamp: datetime, fen: str}}
+verification_sessions: Dict[str, Dict[str, Any]] = {}
+VERIFICATION_THRESHOLD = 0.75  # Overall confidence threshold
+LOW_PIECE_THRESHOLD = 0.5  # Individual piece confidence threshold
+SESSION_TIMEOUT_MINUTES = 5  # Sessions expire after this time
 
 app = FastAPI()
 
@@ -25,15 +35,15 @@ BOARD_MODEL_PATH = os.getenv("BOARD_MODEL_PATH")
 
 # Find primary piece detection model
 if not MODEL_PATH:
-    for path in ["models/detect_pieces_1.onnx", "src/runs/detect_pieces_1.onnx", "runs/detect_pieces_1.onnx"]:
+    for path in ["src/runs/best.pt", "runs/best.pt", "models/detect_pieces_1.onnx", "src/runs/detect_pieces_1.onnx", "runs/detect_pieces_1.onnx"]:
         if os.path.exists(path):
             MODEL_PATH = path
             break
 
-# Find secondary piece detection model (for ensemble)
+# Find secondary piece detection model (for confirmation ensemble)
 if not MODEL_PATH_2:
-    for path in ["models/detect_pieces_v2.onnx", "models/detect_pieces_v2.pt", 
-                 "runs/detect/chess_v2/weights/best.pt", "runs/detect/chess_v2/weights/best.onnx"]:
+    for path in ["models/detect_pieces_1.onnx", "src/runs/detect_pieces_1.onnx", "runs/detect_pieces_1.onnx",
+                 "models/detect_pieces_v2.onnx", "models/detect_pieces_v2.pt"]:
         if os.path.exists(path):
             MODEL_PATH_2 = path
             break
@@ -50,14 +60,14 @@ if MODEL_PATH_2:
     print(f"Loading secondary model from: {MODEL_PATH_2}")
 print(f"Loading board model from: {BOARD_MODEL_PATH}")
 
-# Initialize ensemble if second model available, otherwise use single model
+# Initialize confirmation ensemble if second model available
 USE_ENSEMBLE = MODEL_PATH_2 is not None
 if USE_ENSEMBLE:
-    from ensemble_detector import EnsembleDetector
-    # New model gets higher weight (trained on more diverse data)
-    ensemble_model = EnsembleDetector([MODEL_PATH, MODEL_PATH_2], weights=[0.4, 0.6])
-    model = YOLO(MODEL_PATH)  # Keep for class names
-    print(f"✅ Ensemble mode: Using {MODEL_PATH} + {MODEL_PATH_2}")
+    from ensemble_detector import ConfirmationEnsembleDetector
+    # Primary model (best.pt) weight 0.8, confirmation (ONNX) weight 0.2
+    ensemble_model = ConfirmationEnsembleDetector(MODEL_PATH, MODEL_PATH_2, primary_weight=0.6, confirmation_weight=0.4)
+    model = ensemble_model.primary_model  # Use primary for class names
+    print(f"✅ Confirmation Ensemble: {MODEL_PATH} (primary) + {MODEL_PATH_2} (confirm)")
 else:
     model = YOLO(MODEL_PATH)
     ensemble_model = None
@@ -100,11 +110,11 @@ PIECE_MAP = {
     'black-queen': 'q', 'black-king': 'k'
 }
 
-# Maximum pieces per type (accounting for pawn promotions)
-# King: always 1, Queen: 1 + 8 pawn promotions max = 9, etc.
+# Maximum pieces per type for REAL chess games (no extreme promotions)
+# In practice, even with promotions, you rarely have more than starting pieces
 PIECE_LIMITS = {
-    'K': 1, 'Q': 9, 'R': 10, 'B': 10, 'N': 10, 'P': 8,
-    'k': 1, 'q': 9, 'r': 10, 'b': 10, 'n': 10, 'p': 8
+    'K': 1, 'Q': 1, 'R': 2, 'B': 2, 'N': 2, 'P': 8,
+    'k': 1, 'q': 1, 'r': 2, 'b': 2, 'n': 2, 'p': 8
 }
 
 # Confusion matrix: what a piece might be misdetected as
@@ -550,9 +560,167 @@ def extract_board_polygon(board_results):
     return corners
 
 
-def FEN_extract(pieces, board_corners):
+def extract_grid_positions(pieces, board_corners):
+    """
+    Extract grid positions (row 0-7, col 0-7) with confidence for each piece.
+    Returns a dict: {(row, col): {'piece': 'P', 'confidence': 0.85, 'class': 'white-pawn'}}
+    """
+    grid_positions = {}
+    
+    if not pieces or board_corners is None:
+        return grid_positions
+    
+    # Prepare piece positions
+    piece_positions = []
+    for piece in pieces:
+        x1, y1, x2, y2 = piece['bbox']
+        center_x = (x1 + x2) / 2
+        bottom_y = y2 - 10  # Use bottom of bbox
+        piece_char = PIECE_MAP.get(piece['class'])
+        if piece_char:
+            piece_positions.append({
+                'x': center_x,
+                'y': bottom_y,
+                'piece': piece_char,
+                'class': piece['class'],
+                'confidence': piece['confidence']
+            })
+    
+    # Perspective transform to map to grid
+    src_pts = board_corners.astype(np.float32)
+    dst_pts = np.array([
+        [0, 0], 
+        [INPUT_SIZE, 0], 
+        [INPUT_SIZE, INPUT_SIZE], 
+        [0, INPUT_SIZE]
+    ], dtype=np.float32)
+    
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    
+    for pos in piece_positions:
+        pt = np.array([[[pos['x'], pos['y']]]], dtype=np.float32)
+        warped_pt = cv2.perspectiveTransform(pt, M)[0][0]
+        
+        col = int(warped_pt[0] // (INPUT_SIZE / 8))
+        row = int(warped_pt[1] // (INPUT_SIZE / 8))
+        
+        col = max(0, min(7, col))
+        row = max(0, min(7, row))
+        
+        key = (row, col)
+        
+        # Keep piece with higher confidence if collision
+        if key not in grid_positions or pos['confidence'] > grid_positions[key]['confidence']:
+            grid_positions[key] = {
+                'piece': pos['piece'],
+                'class': pos['class'],
+                'confidence': pos['confidence']
+            }
+    
+    return grid_positions
+
+
+def merge_grid_positions(grid1: dict, grid2: dict) -> dict:
+    """
+    Merge two grid position dicts at the square level (row, col).
+    - If same piece at same square: boost confidence
+    - If different piece at same square: use higher confidence
+    - If piece only in one grid: keep it
+    """
+    merged = {}
+    all_keys = set(grid1.keys()) | set(grid2.keys())
+    
+    print(f"[GridMerge] Grid1: {len(grid1)} pieces, Grid2: {len(grid2)} pieces")
+    
+    for key in all_keys:
+        p1 = grid1.get(key)
+        p2 = grid2.get(key)
+        
+        row, col = key
+        square = f"{chr(ord('a') + col)}{8 - row}"  # e.g., "e4"
+        
+        if p1 and p2:
+            if p1['piece'] == p2['piece']:
+                # Same piece - boost confidence
+                boosted_conf = min(0.99, max(p1['confidence'], p2['confidence']) * 1.3)
+                merged[key] = {
+                    'piece': p1['piece'],
+                    'class': p1['class'],
+                    'confidence': boosted_conf
+                }
+                print(f"[GridMerge] ✓ {square}: {p1['class']} confirmed (conf: {boosted_conf:.2f})")
+            else:
+                # Different piece - use higher confidence
+                if p1['confidence'] >= p2['confidence']:
+                    merged[key] = p1
+                    print(f"[GridMerge] → {square}: {p1['class']} kept over {p2['class']}")
+                else:
+                    merged[key] = p2
+                    print(f"[GridMerge] ⚡ {square}: {p2['class']} replaced {p1['class']}")
+        elif p1:
+            merged[key] = p1
+            print(f"[GridMerge] • {square}: {p1['class']} from img1 only")
+        else:
+            merged[key] = p2
+            print(f"[GridMerge] + {square}: {p2['class']} from img2 only")
+    
+    print(f"[GridMerge] Result: {len(merged)} total pieces")
+    return merged
+
+
+def grid_to_fen(grid_positions: dict, skip_validation: bool = False) -> str:
+    """Convert grid positions dict to FEN string.
+    
+    Args:
+        grid_positions: Dict of {(row, col): {'piece': 'P', 'confidence': 0.85}}
+        skip_validation: If True, skip piece validation (king uniqueness, etc.)
+    """
+    # Initialize empty board
+    fen_positions = [['1' for _ in range(8)] for _ in range(8)]
+    
+    for (row, col), data in grid_positions.items():
+        fen_positions[row][col] = data['piece']
+    
+    # Apply orientation detection and correction
+    piece_list = [{'piece': d['piece'], 'row': r, 'col': c, 'confidence': d['confidence']} 
+                  for (r, c), d in grid_positions.items()]
+    
+    if not skip_validation:
+        fen_positions = validate_and_correct_pieces(fen_positions, piece_list)
+    
+    rotation = detect_board_orientation(fen_positions)
+    if rotation != 0:
+        fen_positions = rotate_board(fen_positions, rotation)
+        print(f"[FEN] Board rotated {rotation}° to correct orientation")
+    
+    # Convert to FEN string
+    fen_rows = []
+    for row in fen_positions:
+        fen_row = ''
+        empty_count = 0
+        for cell in row:
+            if cell == '1':
+                empty_count += 1
+            else:
+                if empty_count > 0:
+                    fen_row += str(empty_count)
+                    empty_count = 0
+                fen_row += cell
+        if empty_count > 0:
+            fen_row += str(empty_count)
+        fen_rows.append(fen_row)
+    
+    return '/'.join(fen_rows)
+
+
+def FEN_extract(pieces, board_corners, skip_validation: bool = False):
     """
     Extract FEN string from piece detections and board corners.
+    
+    Args:
+        pieces: List of detected pieces with bbox and class
+        board_corners: 4 corner points of the board
+        skip_validation: If True, skip piece validation (useful for intermediate steps)
     """
     if not pieces:
         return "8/8/8/8/8/8/8/8"
@@ -652,8 +820,9 @@ def FEN_extract(pieces, board_corners):
                 pos['row'] = row
                 pos['col'] = col
     
-    # Validate and correct pieces based on chess rules
-    fen_positions = validate_and_correct_pieces(fen_positions, piece_positions)
+    # Validate and correct pieces based on chess rules (only if not skipping)
+    if not skip_validation:
+        fen_positions = validate_and_correct_pieces(fen_positions, piece_positions)
     
     # Detect and fix board orientation (white should be at bottom = high row indices)
     rotation = detect_board_orientation(fen_positions)
@@ -699,31 +868,47 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
         # Create debug image copy
         debug_img = img.copy()
 
-        # Run piece detection
-        results = model.predict(img, verbose=False, conf=0.25)
+        # Run piece detection (use ensemble if available)
+        pieces = []
+        if USE_ENSEMBLE and ensemble_model:
+            # Use confirmation ensemble
+            ensemble_preds = ensemble_model.predict(img, conf_threshold=0.25)
+            for pred in ensemble_preds:
+                x1, y1, x2, y2 = map(int, pred['bbox'])
+                pieces.append({
+                    "class": pred['class_name'],
+                    "confidence": pred['confidence'],
+                    "bbox": [x1, y1, x2, y2]
+                })
+                print(f"[Piece] {pred['class_name']} at ({x1},{y1}) conf={pred['confidence']:.2f}")
+                cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 200, 0), 2)
+                cv2.putText(debug_img, f"{pred['class_name']}", (x1, y1 - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
+        else:
+            # Single model mode
+            results = model.predict(img, verbose=False, conf=0.25)
+            for result in results:
+                for box in result.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    pieces.append({
+                        "class": CLASSES[cls_id],
+                        "confidence": conf,
+                        "bbox": [x1, y1, x2, y2]
+                    })
+                    print(f"[Piece] {CLASSES[cls_id]} at ({x1},{y1}) conf={conf:.2f}")
+                    cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 200, 0), 2)
+                    cv2.putText(debug_img, f"{CLASSES[cls_id]}", (x1, y1 - 5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
         
         # Run board detection
         board_results = board_model.predict(img, verbose=False)
 
-        # Extract pieces
-        pieces = []
-        for result in results:
-            for box in result.boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                pieces.append({
-                    "class": CLASSES[cls_id],
-                    "confidence": conf,
-                    "bbox": [x1, y1, x2, y2]
-                })
-                # Log detailed piece info
-                print(f"[Piece] {CLASSES[cls_id]} at ({x1},{y1}) conf={conf:.2f}")
-
-                # Draw piece bounding box (green)
-                cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 200, 0), 2)
-                cv2.putText(debug_img, f"{CLASSES[cls_id]}", (x1, y1 - 5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
+        # Log confidence intervals
+        if pieces:
+            confs = [p['confidence'] for p in pieces]
+            print(f"[Confidence] min={min(confs):.2f}, max={max(confs):.2f}, avg={sum(confs)/len(confs):.2f}, count={len(pieces)}")
 
         # Verify low-confidence pieces with secondary classifier
         verified_count = 0
@@ -776,9 +961,36 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
         cv2.imwrite(debug_path, debug_img_bgr)
         print(f"[Debug] Saved to {debug_path}")
         
-        # Extract FEN
-        fen = FEN_extract(pieces, board_corners)
+        # Calculate confidence metrics FIRST to determine if verification needed
+        avg_confidence = sum(p['confidence'] for p in pieces) / len(pieces) if pieces else 0
+        min_confidence = min(p['confidence'] for p in pieces) if pieces else 0
+        low_confidence_count = sum(1 for p in pieces if p['confidence'] < LOW_PIECE_THRESHOLD)
+        
+        # Determine if verification is needed
+        needs_verification = (
+            avg_confidence < VERIFICATION_THRESHOLD or
+            low_confidence_count >= 2 or
+            min_confidence < 0.4
+        )
+        
+        # Extract FEN - ALWAYS apply validation (user can still take 2nd photo to improve, but FEN must be valid)
+        fen = FEN_extract(pieces, board_corners, skip_validation=False)
         print(f"[FEN] {fen}")
+        
+        # Generate session ID if verification needed
+        session_id = None
+        if needs_verification:
+            # Extract grid positions for later merge
+            grid_positions = extract_grid_positions(pieces, board_corners)
+            session_id = str(uuid.uuid4())[:8]
+            verification_sessions[session_id] = {
+                'grid_positions': {str(k): v for k, v in grid_positions.items()},  # JSON-safe keys
+                'board_corners': board_corners.tolist() if board_corners is not None else None,
+                'fen': fen,
+                'timestamp': datetime.now(),
+                'turn': turn
+            }
+            print(f"[Verification] Session {session_id} created (avg_conf: {avg_confidence:.2f}, grid_pieces: {len(grid_positions)})")
         
         # Get best move from Lichess API
         best_move = get_best_move(fen, turn)
@@ -794,7 +1006,12 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
             # Enhanced detection info
             "detection_mode": "ensemble" if USE_ENSEMBLE else "single",
             "pieces_verified": verified_count,
-            "avg_confidence": round(sum(p['confidence'] for p in pieces) / len(pieces), 3) if pieces else 0,
+            "avg_confidence": round(avg_confidence, 3),
+            "min_confidence": round(min_confidence, 3),
+            # Multi-photo verification
+            "needs_verification": needs_verification,
+            "session_id": session_id,
+            "low_confidence_pieces": low_confidence_count,
         }
 
     except Exception as e:
@@ -802,6 +1019,180 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing image: {e}")
+
+
+@app.post("/detect_fen_verify")
+async def detect_fen_verify(file: UploadFile, session_id: str = Query(...)):
+    """
+    Second photo verification endpoint.
+    Accepts a new photo and session_id from previous detection.
+    Merges results from both photos for improved accuracy.
+    """
+    # Check session exists
+    if session_id not in verification_sessions:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found or expired")
+    
+    session = verification_sessions[session_id]
+    
+    # Check session timeout
+    if datetime.now() - session['timestamp'] > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
+        del verification_sessions[session_id]
+        raise HTTPException(status_code=410, detail=f"Session {session_id} expired")
+    
+    try:
+        # Process second image
+        img_bytes = await file.read()
+        img = preprocess(img_bytes)
+        
+        # Run detection on second image
+        pieces2 = []
+        if USE_ENSEMBLE and ensemble_model:
+            ensemble_preds = ensemble_model.predict(img, conf_threshold=0.25)
+            for pred in ensemble_preds:
+                x1, y1, x2, y2 = map(int, pred['bbox'])
+                pieces2.append({
+                    "class": pred['class_name'],
+                    "confidence": pred['confidence'],
+                    "bbox": [x1, y1, x2, y2]
+                })
+        else:
+            results = model.predict(img, verbose=False, conf=0.25)
+            for result in results:
+                for box in result.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    pieces2.append({
+                        "class": CLASSES[cls_id],
+                        "confidence": conf,
+                        "bbox": [x1, y1, x2, y2]
+                    })
+        
+        print(f"[Verify] Image 2: {len(pieces2)} pieces detected")
+        
+        # Get board corners from second image
+        board_results = board_model.predict(img, verbose=False)
+        board_corners2 = extract_board_polygon(board_results)
+        
+        # Extract grid positions from second image
+        grid2 = extract_grid_positions(pieces2, board_corners2)
+        print(f"[Verify] Image 2 grid: {len(grid2)} pieces mapped")
+        
+        # Restore grid positions from session (convert string keys back to tuples)
+        grid1_raw = session.get('grid_positions', {})
+        grid1 = {eval(k): v for k, v in grid1_raw.items()}
+        print(f"[Verify] Image 1 grid: {len(grid1)} pieces from session")
+        
+        # Merge at GRID level (a1-h8), not bbox level
+        merged_grid = merge_grid_positions(grid1, grid2)
+        
+        # Convert merged grid to FEN
+        fen = grid_to_fen(merged_grid)
+        print(f"[Verify] Merged FEN: {fen}")
+        
+        # Get best move
+        turn = session.get('turn', 'w')
+        best_move = get_best_move(fen, turn)
+        
+        # Calculate final confidence
+        avg_confidence = sum(p['confidence'] for p in merged_grid.values()) / len(merged_grid) if merged_grid else 0
+        
+        # Cleanup session
+        del verification_sessions[session_id]
+        print(f"[Verify] Session {session_id} completed and cleaned up")
+        
+        return {
+            "fen": fen,
+            "pieces_count": len(merged_grid),
+            "board_detected": board_corners2 is not None,
+            "best_move": best_move,
+            "detection_mode": "multi_photo_grid_merge",
+            "avg_confidence": round(avg_confidence, 3),
+            "verification_complete": True,
+        }
+    
+    except Exception as e:
+        print(f"[Verify] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error during verification: {e}")
+
+
+def merge_piece_detections(pieces1: list, pieces2: list) -> list:
+    """
+    Merge piece detections from two images.
+    - If same piece detected in both: boost confidence significantly
+    - If different class for same position: use higher confidence  
+    - Keep ALL pieces from first image (user took verification photo for a reason)
+    - Add unmatched pieces from second image if reasonably confident
+    """
+    merged = []
+    used2 = [False] * len(pieces2)
+    
+    print(f"[Merge] Starting merge: {len(pieces1)} pieces from img1, {len(pieces2)} pieces from img2")
+    
+    for p1 in pieces1:
+        best_match = None
+        best_match_idx = -1
+        best_iou = 0
+        
+        for idx, p2 in enumerate(pieces2):
+            if used2[idx]:
+                continue
+            iou = calculate_iou(p1['bbox'], p2['bbox'])
+            if iou > 0.2 and iou > best_iou:  # Lower IoU threshold (0.2 instead of 0.3)
+                best_iou = iou
+                best_match = p2
+                best_match_idx = idx
+        
+        if best_match:
+            used2[best_match_idx] = True
+            if p1['class'] == best_match['class']:
+                # Same class - boost confidence significantly (detected in BOTH images!)
+                boosted_conf = min(0.99, max(p1['confidence'], best_match['confidence']) * 1.3)
+                merged.append({
+                    'class': p1['class'],
+                    'confidence': boosted_conf,
+                    'bbox': p1['bbox'],
+                    'verified': True
+                })
+                print(f"[Merge] ✓ {p1['class']} confirmed in both images (conf: {boosted_conf:.2f})")
+            else:
+                # Different class - use higher confidence
+                if p1['confidence'] >= best_match['confidence']:
+                    merged.append({**p1, 'verified': False})
+                    print(f"[Merge] → {p1['class']} kept over {best_match['class']}")
+                else:
+                    merged.append({**best_match, 'verified': False})
+                    print(f"[Merge] ⚡ {best_match['class']} replaced {p1['class']}")
+        else:
+            # No match in second image - KEEP IT (user took 2nd photo for a reason)
+            merged.append({**p1, 'verified': False})
+            print(f"[Merge] • Keeping {p1['class']} from img1 (no match in img2)")
+    
+    # Add unmatched pieces from second image with reasonable confidence
+    for idx, p2 in enumerate(pieces2):
+        if not used2[idx] and p2['confidence'] >= 0.4:  # Lower threshold (0.4 instead of 0.7)
+            merged.append({**p2, 'verified': False})
+            print(f"[Merge] + Added {p2['class']} from img2 (conf: {p2['confidence']:.2f})")
+    
+    print(f"[Merge] Result: {len(merged)} total pieces")
+    return merged
+
+
+def calculate_iou(box1: list, box2: list) -> float:
+    """Calculate IoU between two bboxes [x1, y1, x2, y2]."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+    
+    return intersection / union if union > 0 else 0
 
 
 if __name__ == "__main__":

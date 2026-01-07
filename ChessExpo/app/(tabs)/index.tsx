@@ -25,7 +25,7 @@ import { saveToHistory } from './history';
 const SERVER_URL = 'http://192.168.1.63:7860';
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
-type AppState = 'camera' | 'preview' | 'analyzing' | 'result';
+type AppState = 'camera' | 'preview' | 'analyzing' | 'result' | 'verification_needed';
 
 export default function ChessAnalyzerScreen() {
   const [state, setState] = useState<AppState>('camera');
@@ -37,6 +37,11 @@ export default function ChessAnalyzerScreen() {
   const [isWhiteTurn, setIsWhiteTurn] = useState(true);
   const [bestMove, setBestMove] = useState<string | null>(null);
   const [fen, setFen] = useState<string>('');
+  
+  // Multi-photo verification state
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [verificationReason, setVerificationReason] = useState<string>('');
+  const [confidenceInfo, setConfidenceInfo] = useState<{avg: number, min: number, lowCount: number} | null>(null);
 
   const takePhoto = async () => {
     if (!cameraRef.current) return;
@@ -92,18 +97,39 @@ export default function ChessAnalyzerScreen() {
       const data = await response.json();
 
       if (data.fen) {
-        const newBoardState = parseFEN(data.fen);
-        setBoardState(newBoardState);
-        setBestMove(data.best_move || null);
-        setFen(data.fen);
-        setState('result');
-        
-        // Save to history
-        saveToHistory({
-          fen: data.fen,
-          bestMove: data.best_move || null,
-          turn: turn as 'w' | 'b',
-        });
+        // Check if verification is needed
+        if (data.needs_verification && data.session_id) {
+          setSessionId(data.session_id);
+          setConfidenceInfo({
+            avg: data.avg_confidence,
+            min: data.min_confidence,
+            lowCount: data.low_confidence_pieces || 0,
+          });
+          setVerificationReason(
+            data.avg_confidence < 0.75 
+              ? 'Confiance moyenne trop basse'
+              : `${data.low_confidence_pieces || 0} pièces incertaines`
+          );
+          // Store preliminary results
+          setBoardState(parseFEN(data.fen));
+          setFen(data.fen);
+          setBestMove(data.best_move || null);
+          setState('verification_needed');
+        } else {
+          // Good confidence - show result directly
+          const newBoardState = parseFEN(data.fen);
+          setBoardState(newBoardState);
+          setBestMove(data.best_move || null);
+          setFen(data.fen);
+          setState('result');
+          
+          // Save to history
+          saveToHistory({
+            fen: data.fen,
+            bestMove: data.best_move || null,
+            turn: turn as 'w' | 'b',
+          });
+        }
       } else {
         throw new Error('Aucune position détectée');
       }
@@ -113,11 +139,108 @@ export default function ChessAnalyzerScreen() {
     }
   };
 
+  const takeVerificationPhoto = async () => {
+    if (!cameraRef.current) return;
+    try {
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.8 });
+      if (photo?.uri) {
+        analyzeVerificationPhoto(photo.uri);
+      }
+    } catch (error) {
+      Alert.alert('Erreur', 'Impossible de prendre la photo');
+    }
+  };
+
+  const pickVerificationFromGallery = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        quality: 0.8,
+      });
+      if (!result.canceled && result.assets[0]) {
+        analyzeVerificationPhoto(result.assets[0].uri);
+      }
+    } catch (error) {
+      Alert.alert('Erreur', 'Impossible de charger l\'image');
+    }
+  };
+
+  const analyzeVerificationPhoto = async (verifyPhotoUri: string) => {
+    if (!sessionId) {
+      Alert.alert('Erreur', 'Session expirée, veuillez recommencer');
+      reset();
+      return;
+    }
+    
+    setState('analyzing');
+
+    try {
+      const formData = new FormData();
+      formData.append('file', {
+        uri: verifyPhotoUri,
+        name: 'photo.jpg',
+        type: 'image/jpeg',
+      } as any);
+
+      const response = await fetch(`${SERVER_URL}/detect_fen_verify?session_id=${sessionId}`, {
+        method: 'POST',
+        body: formData,
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+
+      if (!response.ok) {
+        if (response.status === 410) {
+          throw new Error('Session expirée, veuillez recommencer');
+        }
+        throw new Error(`Erreur serveur: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (data.fen) {
+        const newBoardState = parseFEN(data.fen);
+        setBoardState(newBoardState);
+        setBestMove(data.best_move || null);
+        setFen(data.fen);
+        setSessionId(null);
+        setState('result');
+        
+        // Save to history
+        const turn = isWhiteTurn ? 'w' : 'b';
+        saveToHistory({
+          fen: data.fen,
+          bestMove: data.best_move || null,
+          turn: turn as 'w' | 'b',
+        });
+      } else {
+        throw new Error('Erreur lors de la vérification');
+      }
+    } catch (error) {
+      Alert.alert('Erreur', (error as Error).message);
+      setState('verification_needed');
+    }
+  };
+
+  const skipVerification = () => {
+    // User accepts preliminary result without second photo
+    const turn = isWhiteTurn ? 'w' : 'b';
+    saveToHistory({
+      fen: fen,
+      bestMove: bestMove || null,
+      turn: turn as 'w' | 'b',
+    });
+    setSessionId(null);
+    setState('result');
+  };
+
   const reset = () => {
     setPhotoUri(null);
     setBoardState(createEmptyBoard());
     setBestMove(null);
     setFen('');
+    setSessionId(null);
+    setVerificationReason('');
+    setConfidenceInfo(null);
     setState('camera');
   };
 
@@ -240,6 +363,50 @@ export default function ChessAnalyzerScreen() {
             <ActivityIndicator size="large" color="#6366f1" />
             <Text style={styles.analyzingText}>Analyse en cours...</Text>
             <Text style={styles.analyzingSubtext}>Détection des pièces et calcul du meilleur coup</Text>
+          </View>
+        )}
+
+        {/* Verification Needed */}
+        {state === 'verification_needed' && (
+          <View style={styles.cameraWrapper}>
+            <View style={styles.verificationHeader}>
+              <View style={styles.warningBadge}>
+                <Ionicons name="warning" size={20} color="#fbbf24" />
+                <Text style={styles.warningText}>Vérification recommandée</Text>
+              </View>
+              <Text style={styles.verificationReason}>{verificationReason}</Text>
+              {confidenceInfo && (
+                <Text style={styles.confidenceText}>
+                  Confiance: {Math.round(confidenceInfo.avg * 100)}% (min: {Math.round(confidenceInfo.min * 100)}%)
+                </Text>
+              )}
+            </View>
+
+            <CameraView ref={cameraRef} style={styles.verificationCamera} facing="back">
+              <View style={styles.cameraOverlay}>
+                <View style={styles.scanFrame}>
+                  <View style={[styles.corner, styles.cornerTL]} />
+                  <View style={[styles.corner, styles.cornerTR]} />
+                  <View style={[styles.corner, styles.cornerBL]} />
+                  <View style={[styles.corner, styles.cornerBR]} />
+                </View>
+                <Text style={styles.scanHint}>Prenez une 2ème photo sous un angle différent</Text>
+              </View>
+            </CameraView>
+            
+            <View style={styles.verificationControls}>
+              <TouchableOpacity style={styles.iconButton} onPress={pickVerificationFromGallery}>
+                <Ionicons name="images" size={26} color="#fff" />
+              </TouchableOpacity>
+              
+              <TouchableOpacity style={styles.captureButton} onPress={takeVerificationPhoto}>
+                <View style={styles.captureInner} />
+              </TouchableOpacity>
+              
+              <TouchableOpacity style={styles.iconButton} onPress={skipVerification}>
+                <Ionicons name="checkmark" size={26} color="#4ade80" />
+              </TouchableOpacity>
+            </View>
           </View>
         )}
 
@@ -432,4 +599,34 @@ const styles = StyleSheet.create({
   },
   fenLabel: { color: '#9ca3af', fontSize: 12, marginBottom: 5 },
   fenText: { color: '#fff', fontSize: 12, fontFamily: 'monospace' },
+
+  // Verification
+  verificationHeader: {
+    backgroundColor: 'rgba(251,191,36,0.1)',
+    padding: 15,
+    alignItems: 'center',
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(251,191,36,0.2)',
+  },
+  warningBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(251,191,36,0.2)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    marginBottom: 8,
+  },
+  warningText: { color: '#fbbf24', fontSize: 14, fontWeight: '600', marginLeft: 6 },
+  verificationReason: { color: '#fff', fontSize: 14, marginBottom: 4 },
+  confidenceText: { color: '#9ca3af', fontSize: 12 },
+  verificationCamera: { flex: 1 },
+  verificationControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 30,
+    paddingVertical: 25,
+    backgroundColor: 'rgba(26,26,46,0.95)',
+  },
 });

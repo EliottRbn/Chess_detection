@@ -172,3 +172,144 @@ def create_ensemble_detector(old_model_path: str, new_model_path: str,
         model_paths=[old_model_path, new_model_path],
         weights=[old_weight, new_weight]
     )
+
+
+class ConfirmationEnsembleDetector:
+    """
+    Confirmation-based ensemble where primary model (best.pt) is the source of truth
+    and secondary model (ONNX) only confirms/corrects color disagreements.
+    """
+    
+    def __init__(self, primary_model_path: str, confirmation_model_path: str,
+                 primary_weight: float = 0.8, confirmation_weight: float = 0.2):
+        """
+        Args:
+            primary_model_path: Path to primary model (best.pt - YOLOv11)
+            confirmation_model_path: Path to confirmation model (ONNX - legacy)
+            primary_weight: Weight for primary model (default 0.8)
+            confirmation_weight: Weight for confirmation (default 0.2)
+        """
+        self.primary_model = YOLO(primary_model_path)
+        self.confirmation_model = YOLO(confirmation_model_path)
+        self.primary_weight = primary_weight
+        self.confirmation_weight = confirmation_weight
+        
+        print(f"[ConfirmationEnsemble] Primary: {primary_model_path.split('/')[-1]} (weight: {primary_weight})")
+        print(f"[ConfirmationEnsemble] Confirmation: {confirmation_model_path.split('/')[-1]} (weight: {confirmation_weight})")
+    
+    def _get_piece_type(self, class_name: str) -> str:
+        """Extract piece type without color (e.g., 'white-pawn' -> 'pawn')"""
+        return class_name.split('-')[-1] if '-' in class_name else class_name
+    
+    def _get_piece_color(self, class_name: str) -> str:
+        """Extract color from class name (e.g., 'white-pawn' -> 'white')"""
+        return class_name.split('-')[0] if '-' in class_name else 'unknown'
+    
+    def _iou(self, box1: List[float], box2: List[float]) -> float:
+        """Calculate IoU between two boxes."""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0
+    
+    def predict(self, image, conf_threshold: float = 0.25, iou_threshold: float = 0.5):
+        """
+        Run confirmation-based ensemble prediction.
+        
+        1. Get predictions from primary model (best.pt)
+        2. Get predictions from confirmation model (ONNX)
+        3. For each primary prediction:
+           - If confirmation agrees on piece type AND color: boost confidence
+           - If confirmation agrees on type but different color: use higher weighted confidence
+           - If no confirmation match: keep primary prediction as-is
+        """
+        # Primary predictions
+        primary_preds = []
+        primary_results = self.primary_model.predict(image, verbose=False, conf=conf_threshold)
+        for result in primary_results:
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = map(float, box.xyxy[0])
+                primary_preds.append({
+                    'class': cls_id,
+                    'class_name': self.primary_model.names[cls_id],
+                    'confidence': conf,
+                    'bbox': [x1, y1, x2, y2],
+                    'source': 'primary'
+                })
+        
+        # Confirmation predictions
+        confirm_preds = []
+        confirm_results = self.confirmation_model.predict(image, verbose=False, conf=conf_threshold)
+        for result in confirm_results:
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = map(float, box.xyxy[0])
+                confirm_preds.append({
+                    'class': cls_id,
+                    'class_name': self.confirmation_model.names[cls_id],
+                    'confidence': conf,
+                    'bbox': [x1, y1, x2, y2],
+                    'source': 'confirmation'
+                })
+        
+        # Match and confirm
+        final_preds = []
+        for pred in primary_preds:
+            best_match = None
+            best_iou = 0
+            
+            # Find best matching confirmation prediction
+            for cpred in confirm_preds:
+                iou = self._iou(pred['bbox'], cpred['bbox'])
+                if iou > iou_threshold and iou > best_iou:
+                    best_iou = iou
+                    best_match = cpred
+            
+            if best_match:
+                primary_type = self._get_piece_type(pred['class_name'])
+                confirm_type = self._get_piece_type(best_match['class_name'])
+                primary_color = self._get_piece_color(pred['class_name'])
+                confirm_color = self._get_piece_color(best_match['class_name'])
+                
+                if primary_type == confirm_type:
+                    if primary_color == confirm_color:
+                        # Full agreement - boost confidence
+                        pred['confidence'] = min(0.99, pred['confidence'] * 1.15)
+                        pred['confirmation'] = 'agreed'
+                        print(f"[Confirm] ✓ {pred['class_name']} confirmed (conf: {pred['confidence']:.2f})")
+                    else:
+                        # Same piece type, different color - weighted vote
+                        primary_score = pred['confidence'] * self.primary_weight
+                        confirm_score = best_match['confidence'] * self.confirmation_weight
+                        
+                        if primary_score >= confirm_score:
+                            # Keep primary color
+                            pred['confirmation'] = 'primary_color_kept'
+                            print(f"[Confirm] → {pred['class_name']} kept (primary: {primary_score:.2f} >= confirm: {confirm_score:.2f})")
+                        else:
+                            # Use confirmation color
+                            old_class = pred['class_name']
+                            pred['class_name'] = best_match['class_name']
+                            pred['class'] = best_match['class']
+                            pred['confirmation'] = 'color_corrected'
+                            print(f"[Confirm] ⚡ {old_class} → {pred['class_name']} (confirm won: {confirm_score:.2f} > {primary_score:.2f})")
+                else:
+                    # Different piece types - trust primary
+                    pred['confirmation'] = 'type_mismatch'
+            else:
+                pred['confirmation'] = 'no_match'
+            
+            final_preds.append(pred)
+        
+        return final_preds
+
