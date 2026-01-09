@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy models
-COPY src/runs/detect_pieces_1.onnx ./models/
+# Copy models (best.pt for pieces, chessboard_detection.pt for board)
+COPY src/runs/best.pt ./models/
 COPY src/runs/chessboard_detection.pt ./models/
 
 # Copy app code

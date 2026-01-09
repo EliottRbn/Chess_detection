@@ -16,7 +16,7 @@ models/*.bin
 !models/.gitkeep
 # runs/
 # src/runs/
-!src/runs/detect_pieces_1.onnx
+!src/runs/best.pt
 !src/runs/chessboard_detection.pt
 
 # Logs & Debug
