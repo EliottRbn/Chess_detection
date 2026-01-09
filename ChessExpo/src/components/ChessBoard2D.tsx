@@ -10,6 +10,9 @@ interface ChessBoard2DProps {
   highlightTo?: string;
   onSquarePress?: (square: string) => void;  // For piece editing
   selectedSquare?: string | null;  // Currently selected square
+  // Playing mode props
+  flipBlackPieces?: boolean;  // Rotate black pieces 180° for face-to-face play
+  legalMoves?: string[];  // Squares to highlight as legal moves
 }
 
 const LIGHT_SQUARE = '#F0D9B5';
@@ -17,6 +20,7 @@ const DARK_SQUARE = '#B58863';
 const HIGHLIGHT_FROM = 'rgba(255, 235, 59, 0.6)';
 const HIGHLIGHT_TO = 'rgba(76, 175, 80, 0.6)';
 const ARROW_COLOR = 'rgba(255, 80, 80, 0.9)';
+const LEGAL_MOVE_COLOR = 'rgba(76, 175, 80, 0.7)';
 
 // Piece images mapping
 const PIECE_IMAGES: Record<string, any> = {
@@ -49,17 +53,26 @@ export function ChessBoard2D({
   highlightTo,
   onSquarePress,
   selectedSquare,
+  flipBlackPieces = false,
+  legalMoves = [],
 }: ChessBoard2DProps) {
   const squareSize = size / 8;
   
   const fromSquare = parseSquare(highlightFrom || '');
   const toSquare = parseSquare(highlightTo || '');
   const selectedPos = parseSquare(selectedSquare || '');
+  
+  // Parse legal moves to check quickly
+  const legalMoveSet = new Set(legalMoves);
 
   const renderPiece = (piece: PieceType, squareSize: number) => {
     if (!piece) return null;
     const imageSource = PIECE_IMAGES[piece];
     if (!imageSource) return null;
+    
+    // Check if black piece (lowercase) and should be flipped
+    const isBlackPiece = piece === piece.toLowerCase();
+    const shouldFlip = flipBlackPieces && isBlackPiece;
     
     return (
       <Image 
@@ -67,6 +80,7 @@ export function ChessBoard2D({
         style={{ 
           width: squareSize * 0.85, 
           height: squareSize * 0.85,
+          transform: shouldFlip ? [{ rotate: '180deg' }] : [],
         }} 
         resizeMode="contain"
       />
@@ -83,6 +97,7 @@ export function ChessBoard2D({
     const isFromSquare = fromSquare && fromSquare.row === row && fromSquare.col === col;
     const isToSquare = toSquare && toSquare.row === row && toSquare.col === col;
     const isSelected = selectedPos && selectedPos.row === row && selectedPos.col === col;
+    const isLegalMove = legalMoveSet.has(squareNotation);
     
     let backgroundColor = isLight ? LIGHT_SQUARE : DARK_SQUARE;
     if (isFromSquare) backgroundColor = HIGHLIGHT_FROM;
@@ -92,6 +107,23 @@ export function ChessBoard2D({
     const squareContent = (
       <>
         {renderPiece(piece, squareSize)}
+        
+        {/* Legal move indicator - dot or ring */}
+        {isLegalMove && (
+          piece ? (
+            // Ring around capturable piece
+            <View style={[
+              styles.captureRing,
+              { width: squareSize * 0.9, height: squareSize * 0.9, borderRadius: squareSize * 0.45 }
+            ]} />
+          ) : (
+            // Dot for empty square
+            <View style={[
+              styles.legalMoveDot,
+              { width: squareSize * 0.3, height: squareSize * 0.3, borderRadius: squareSize * 0.15 }
+            ]} />
+          )
+        )}
         
         {row === 7 && (
           <Text style={[styles.fileLabel, { color: isLight ? DARK_SQUARE : LIGHT_SQUARE }]}>
@@ -234,5 +266,15 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 0,
     left: 0,
+  },
+  legalMoveDot: {
+    position: 'absolute',
+    backgroundColor: 'rgba(76, 175, 80, 0.7)',
+  },
+  captureRing: {
+    position: 'absolute',
+    borderWidth: 3,
+    borderColor: 'rgba(76, 175, 80, 0.8)',
+    backgroundColor: 'transparent',
   },
 });

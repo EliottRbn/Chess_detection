@@ -65,7 +65,8 @@ if MODEL_PATH_2:
 print(f"Loading board model from: {BOARD_MODEL_PATH}")
 
 # Initialize confirmation ensemble if second model available
-USE_ENSEMBLE = MODEL_PATH_2 is not None
+#USE_ENSEMBLE = MODEL_PATH_2 is not None
+USE_ENSEMBLE = False
 if USE_ENSEMBLE:
     from ensemble_detector import ConfirmationEnsembleDetector
     # Primary model (best.pt) weight 0.8, confirmation (ONNX) weight 0.2
@@ -99,7 +100,9 @@ if USE_CLASSIFIER:
 else:
     piece_verifier = None
 
-INPUT_SIZE = 640
+BOARD_SIZE = 640    # Board detection model trained on 640
+PIECE_SIZE = 1280   # Higher resolution for better piece detection
+INPUT_SIZE = BOARD_SIZE  # Default for compatibility
 
 
 CLASSES = model.names
@@ -112,6 +115,24 @@ PIECE_MAP = {
     'black-pawn': 'p', 'black-rook': 'r', 
     'black-knight': 'n', 'black-bishop': 'b',
     'black-queen': 'q', 'black-king': 'k'
+}
+
+# Colors for debug visualization (RGB) - distinct colors per piece type
+PIECE_COLORS = {
+    # White pieces - warm colors
+    'white-pawn': (255, 200, 100),    # Light orange
+    'white-rook': (255, 100, 100),    # Light red
+    'white-knight': (255, 150, 200),  # Pink
+    'white-bishop': (255, 255, 100),  # Yellow
+    'white-queen': (255, 50, 255),    # Magenta
+    'white-king': (255, 255, 255),    # White
+    # Black pieces - cool colors
+    'black-pawn': (100, 200, 255),    # Light blue
+    'black-rook': (100, 100, 255),    # Blue
+    'black-knight': (150, 100, 200),  # Purple
+    'black-bishop': (100, 255, 200),  # Cyan/Teal
+    'black-queen': (50, 255, 50),     # Green
+    'black-king': (128, 128, 128),    # Gray
 }
 
 # Maximum pieces per type for REAL chess games (no extreme promotions)
@@ -164,6 +185,7 @@ def get_best_move(fen, turn='w'):
         
         # Complete FEN with turn info (no castling, no en passant, counters)
         full_fen = f"{fen} {turn} - - 0 1"
+        print(f"[Stockfish] Analyzing FEN: {full_fen}")
         
         # Run Stockfish as subprocess
         process = subprocess.Popen(
@@ -174,11 +196,11 @@ def get_best_move(fen, turn='w'):
             text=True
         )
         
-        # Send commands to Stockfish
+        # Send commands to Stockfish (depth 20 for better accuracy)
         commands = f"""uci
 isready
 position fen {full_fen}
-go depth 15
+go depth 20
 """
         stdout, stderr = process.communicate(input=commands, timeout=10)
         
@@ -303,10 +325,13 @@ def flip_board(fen_positions):
 
 def validate_and_correct_pieces(fen_positions, piece_detections):
     """
-    Apply chess rules to correct obvious detection errors.
-    - Enforce exactly 1 king per color
-    - Enforce max piece limits
-    - Convert excess pieces to next most likely alternative (don't just remove)
+    Apply chess rules to correct obvious detection errors with position-aware logic.
+    
+    Improvements:
+    1. Color inference by position: rows 0-1 likely black, rows 6-7 likely white
+    2. Natural king zones: prioritize king candidates near home position
+    3. Intelligent swapping between similar pieces (K↔Q, B↔P)
+    
     Returns corrected fen_positions.
     """
     # Build a map of position -> (piece, confidence)
@@ -321,104 +346,199 @@ def validate_and_correct_pieces(fen_positions, piece_detections):
                 'confidence': detection.get('confidence', 0.5)
             }
     
-    # Count pieces and track their positions with confidence
-    piece_positions = {}  # piece -> list of (row, col, confidence)
+    # === STEP 0: Color consistency check ===
+    # If a piece is on the "wrong" side of the board, it might be misclassified
+    corrections_made = []
+    
+    for row_idx, row in enumerate(fen_positions):
+        for col_idx, cell in enumerate(row):
+            if cell == '1':
+                continue
+            
+            is_white_piece = cell.isupper()
+            is_black_piece = cell.islower()
+            
+            # Expected color based on position
+            # Rows 0-2: more likely black pieces (black's home side)
+            # Rows 5-7: more likely white pieces (white's home side)
+            expected_black = row_idx <= 2
+            expected_white = row_idx >= 5
+            
+            conf = position_info.get((row_idx, col_idx), {}).get('confidence', 0.5)
+            
+            # Flag suspicious detections: wrong color for position with low confidence
+            if expected_black and is_white_piece and conf < 0.7:
+                # White piece on black's side with low confidence - might be black
+                opposite = cell.lower()  # Convert to black version
+                print(f"[ColorCheck] Suspicious: {cell} at ({row_idx},{col_idx}) conf={conf:.2f} - expected black")
+                # For now, just log - we'll handle in king search
+            elif expected_white and is_black_piece and conf < 0.7:
+                opposite = cell.upper()  # Convert to white version
+                print(f"[ColorCheck] Suspicious: {cell} at ({row_idx},{col_idx}) conf={conf:.2f} - expected white")
+    
+    # === STEP 1: Count pieces and track positions ===
+    piece_positions = {}  # piece -> list of (row, col, confidence, position_score)
     for row_idx, row in enumerate(fen_positions):
         for col_idx, cell in enumerate(row):
             if cell != '1':
                 if cell not in piece_positions:
                     piece_positions[cell] = []
-                # Get confidence from detection info if available
                 conf = position_info.get((row_idx, col_idx), {}).get('confidence', 0.5)
-                piece_positions[cell].append((row_idx, col_idx, conf))
+                
+                # Calculate position score: 1.0 if piece color matches expected side
+                is_white = cell.isupper()
+                if is_white:
+                    position_score = 1.0 if row_idx >= 4 else 0.6  # White pieces more likely on rows 4-7
+                else:
+                    position_score = 1.0 if row_idx <= 3 else 0.6  # Black pieces more likely on rows 0-3
+                
+                piece_positions[cell].append((row_idx, col_idx, conf, position_score))
     
-    # Count pieces
     piece_counts = {p: len(positions) for p, positions in piece_positions.items()}
     print(f"[Validation] Piece counts: {piece_counts}")
     
-    corrections_made = []
+    # === STEP 2: Enforce piece limits with intelligent swapping ===
+    # Similar pieces that can be confused
+    SIMILAR_PIECES = {
+        'Q': ['K', 'R'],  # Queen confused with King or Rook
+        'q': ['k', 'r'],
+        'K': ['Q'],       # King confused with Queen
+        'k': ['q'],
+        'B': ['P', 'N'],  # Bishop confused with Pawn or Knight
+        'b': ['p', 'n'],
+        'R': ['Q'],       # Rook confused with Queen
+        'r': ['q'],
+    }
     
-    # Enforce limits for each piece type
     for piece, positions in piece_positions.items():
         max_allowed = PIECE_LIMITS.get(piece, 10)
         
         if len(positions) > max_allowed:
             excess = len(positions) - max_allowed
             
-            # Sort by confidence (lowest first) to convert least confident
-            positions_sorted = sorted(positions, key=lambda x: x[2])
+            # Sort by combined score (confidence * position_score), lowest first
+            positions_sorted = sorted(positions, key=lambda x: x[2] * x[3])
             
-            # Convert excess pieces to next most likely alternative
             for i in range(excess):
-                row, col, conf = positions_sorted[i]
+                row, col, conf, pos_score = positions_sorted[i]
                 original_piece = fen_positions[row][col]
                 
-                # Get the most likely alternative from confusion matrix
-                alternatives = LIKELY_CONFUSIONS.get(original_piece, [])
+                # Try similar pieces first, then confusion matrix
+                alternatives = SIMILAR_PIECES.get(original_piece, []) + LIKELY_CONFUSIONS.get(original_piece, [])
                 new_piece = None
                 
-                if alternatives:
-                    # Find first alternative that doesn't exceed its limit
-                    for alt in alternatives:
-                        alt_count = piece_counts.get(alt, 0)
-                        alt_limit = PIECE_LIMITS.get(alt, 10)
-                        if alt_count < alt_limit:
-                            new_piece = alt
-                            piece_counts[alt] = alt_count + 1
-                            break
+                for alt in alternatives:
+                    alt_count = piece_counts.get(alt, 0)
+                    alt_limit = PIECE_LIMITS.get(alt, 10)
+                    if alt_count < alt_limit:
+                        new_piece = alt
+                        piece_counts[alt] = alt_count + 1
+                        break
                 
                 if new_piece:
                     fen_positions[row][col] = new_piece
                     corrections_made.append(f"{original_piece}->{new_piece} at ({row},{col}) conf={conf:.2f}")
                     print(f"[Validation] Converted {original_piece} to {new_piece} at ({row},{col})")
                 else:
-                    # No valid alternative, just remove
                     fen_positions[row][col] = '1'
                     corrections_made.append(f"Removed {original_piece} at ({row},{col}) conf={conf:.2f}")
             
             piece_counts[piece] = max_allowed
             print(f"[Validation] {piece}: {len(positions)} -> {max_allowed}")
     
-    # Pieces that could be confused with king (in order of likelihood)
-    KING_CANDIDATES = {
-        'K': ['Q', 'R', 'B'],  # White pieces that might be a white king
-        'k': ['q', 'r', 'b']   # Black pieces that might be a black king
+    # === STEP 3: Ensure exactly 1 king per color with position-aware search ===
+    # Natural king zones (where kings are most likely to be)
+    KING_ZONES = {
+        'K': [(7, 4), (7, 3), (7, 5), (6, 4), (6, 3), (6, 5)],  # White king near e1
+        'k': [(0, 4), (0, 3), (0, 5), (1, 4), (1, 3), (1, 5)]   # Black king near e8
     }
     
-    # Ensure exactly 1 king per color - if missing, promote the best candidate
+    # Pieces that could be confused with king, prioritizing by visual similarity
+    KING_CANDIDATES = {
+        'K': ['Q', 'R', 'B', 'N'],  # White pieces, Queen most similar to King
+        'k': ['q', 'r', 'b', 'n']   # Black pieces
+    }
+    
     for king in ['K', 'k']:
-        # Recount after previous corrections
-        king_count = sum(1 for row in fen_positions for cell in row if cell == king)
+        # Recount after corrections
+        king_positions = [(r, c) for r, row in enumerate(fen_positions) for c, cell in enumerate(row) if cell == king]
         
-        if king_count == 0:
+        if len(king_positions) == 0:
             color = "white" if king == 'K' else "black"
-            print(f"[Validation] No {color} king detected - looking for candidate to promote")
+            print(f"[Validation] No {color} king detected - searching with position priority")
             
-            # Find the best candidate to promote to king
             candidates = KING_CANDIDATES[king]
+            king_zone = KING_ZONES[king]
             best_candidate = None
             best_pos = None
+            best_score = -1
             
+            # Step 3a: First, look for candidates IN the natural king zone
+            # PREFER LOW CONFIDENCE pieces - they're more likely to be misclassified
             for candidate in candidates:
-                if candidate in piece_positions and piece_positions[candidate]:
-                    # Get the highest confidence piece of this type
-                    positions_sorted = sorted(piece_positions[candidate], key=lambda x: x[2], reverse=True)
-                    for row, col, conf in positions_sorted:
-                        # Check if this position still has this piece (not already converted)
-                        if fen_positions[row][col] == candidate:
+                if candidate in piece_positions:
+                    for row, col, conf, pos_score in piece_positions[candidate]:
+                        if fen_positions[row][col] != candidate:
+                            continue  # Already converted
+                        
+                        # Skip high-confidence pieces - they're probably correct!
+                        if conf > 0.75:
+                            print(f"[Validation] Skipping {candidate} at ({row},{col}) - too confident ({conf:.2f})")
+                            continue
+                        
+                        # Calculate king candidate score
+                        # Use INVERTED confidence: low confidence = higher chance of misclassification
+                        conf_score = 1.0 - conf  # Low conf = high score
+                        
+                        in_zone = (row, col) in king_zone
+                        zone_bonus = 3.0 if in_zone else 1.0
+                        
+                        # Position correctness for this color
+                        if king == 'k':  # Black king should be on rows 0-2
+                            side_bonus = 3.0 if row <= 2 else 0.5
+                        else:  # White king should be on rows 5-7
+                            side_bonus = 3.0 if row >= 5 else 0.5
+                        
+                        score = conf_score * zone_bonus * side_bonus
+                        
+                        if score > best_score:
+                            best_score = score
                             best_candidate = candidate
                             best_pos = (row, col, conf)
-                            break
-                    if best_candidate:
-                        break
+            
+            # Step 3b: If no good candidate found, look at pieces of OPPOSITE color
+            # (might be misclassified color)
+            if best_score < 0.5:
+                opposite_candidates = KING_CANDIDATES['k' if king == 'K' else 'K']
+                for candidate in opposite_candidates:
+                    if candidate in piece_positions:
+                        for row, col, conf, pos_score in piece_positions[candidate]:
+                            if fen_positions[row][col] != candidate:
+                                continue
+                            
+                            # Check if this piece is in the wrong king's zone
+                            if king == 'k' and row <= 2:  # Looking for black king, piece on black side
+                                score = conf * 1.5
+                                if score > best_score:
+                                    best_score = score
+                                    best_candidate = candidate
+                                    best_pos = (row, col, conf)
+                                    print(f"[Validation] Found opposite-color candidate {candidate} at ({row},{col}) for {king}")
+                            elif king == 'K' and row >= 5:  # Looking for white king, piece on white side
+                                score = conf * 1.5
+                                if score > best_score:
+                                    best_score = score
+                                    best_candidate = candidate
+                                    best_pos = (row, col, conf)
+                                    print(f"[Validation] Found opposite-color candidate {candidate} at ({row},{col}) for {king}")
             
             if best_candidate and best_pos:
                 row, col, conf = best_pos
                 fen_positions[row][col] = king
-                corrections_made.append(f"{best_candidate}->{king} at ({row},{col}) conf={conf:.2f} (king required)")
-                print(f"[Validation] Promoted {best_candidate} to {king} at ({row},{col}) - king is required!")
+                corrections_made.append(f"{best_candidate}->{king} at ({row},{col}) conf={conf:.2f} score={best_score:.2f} (king required)")
+                print(f"[Validation] Promoted {best_candidate} to {king} at ({row},{col}) - score={best_score:.2f}")
             else:
-                print(f"[Validation] WARNING: Could not find a candidate to promote to {color} king!")
+                print(f"[Validation] WARNING: Could not find candidate for {color} king!")
     
     if corrections_made:
         print(f"[Validation] Corrections: {corrections_made}")
@@ -428,13 +548,127 @@ def validate_and_correct_pieces(fen_positions, piece_detections):
     return fen_positions
 
 
+def letterbox_resize(img, target_size=640, fill_color=(114, 114, 114)):
+    """
+    Resize image preserving aspect ratio with padding.
+    
+    Args:
+        img: Input image (H, W, C)
+        target_size: Target square size
+        fill_color: Padding color (gray by default)
+    
+    Returns:
+        padded: Resized and padded image (target_size x target_size)
+        scale: Scale factor used
+        pad_left: Left padding offset
+        pad_top: Top padding offset
+    """
+    h, w = img.shape[:2]
+    scale = min(target_size / w, target_size / h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    
+    resized = cv2.resize(img, (new_w, new_h))
+    
+    # Create padded image with fill color
+    padded = np.full((target_size, target_size, 3), fill_color, dtype=np.uint8)
+    pad_top = (target_size - new_h) // 2
+    pad_left = (target_size - new_w) // 2
+    padded[pad_top:pad_top+new_h, pad_left:pad_left+new_w] = resized
+    
+    return padded, scale, pad_left, pad_top
+
+
 def preprocess(image_bytes):
     """Preprocess image bytes to numpy array for YOLO inference."""
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (INPUT_SIZE, INPUT_SIZE))
-    return img
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img_rgb  # Return raw RGB image
+
+
+def preprocess_for_board(img_rgb):
+    """Letterbox resize for board detection at 640."""
+    img_letterbox, scale, pad_left, pad_top = letterbox_resize(img_rgb, BOARD_SIZE)
+    return img_letterbox, scale, pad_left, pad_top
+
+
+def preprocess_for_pieces(img_rgb):
+    """Letterbox resize for piece detection at 1280."""
+    img_letterbox, scale, pad_left, pad_top = letterbox_resize(img_rgb, PIECE_SIZE)
+    return img_letterbox, scale, pad_left, pad_top
+
+
+def draw_debug_image(base_img, pieces, board_corners=None, title="Detection"):
+    """
+    Draw debug visualization with color-coded pieces.
+    
+    Args:
+        base_img: Base image to draw on (will be copied)
+        pieces: List of piece detections with 'class', 'confidence', 'bbox'
+        board_corners: Optional board corners to draw (will be scaled if needed)
+        title: Title to display on the image
+    
+    Returns:
+        Debug image with visualizations
+    """
+    debug_img = base_img.copy()
+    h, w = debug_img.shape[:2]
+    
+    # Draw board corners if available
+    if board_corners is not None:
+        corners_int = board_corners.astype(np.int32)
+        cv2.polylines(debug_img, [corners_int], isClosed=True, color=(0, 0, 255), thickness=4)
+        for i, corner in enumerate(board_corners):
+            pt = (int(corner[0]), int(corner[1]))
+            cv2.circle(debug_img, pt, 10, (255, 0, 0), -1)
+    
+    # Draw pieces with color codes and confidence %
+    for p in pieces:
+        x1, y1, x2, y2 = p['bbox']
+        piece_class = p['class']
+        conf = p.get('confidence', 0)
+        
+        color = PIECE_COLORS.get(piece_class, (200, 200, 200))
+        cv2.rectangle(debug_img, (x1, y1), (x2, y2), color, 3)
+        
+        # Confidence text above box
+        conf_text = f"{conf:.0%}"
+        cv2.putText(debug_img, conf_text, (x1, y1 - 5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    # Draw legend at bottom - bigger for 1280
+    legend_h = 100
+    legend = np.zeros((legend_h, w, 3), dtype=np.uint8)
+    legend.fill(30)  # Dark background
+    
+    # Title
+    cv2.putText(legend, title, (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
+    # White pieces row
+    cv2.putText(legend, "WHITE:", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    white_pieces = [('white-pawn', 'Pawn'), ('white-rook', 'Rook'), ('white-knight', 'Knight'),
+                    ('white-bishop', 'Bishop'), ('white-queen', 'Queen'), ('white-king', 'King')]
+    x_offset = 100
+    for piece_key, piece_name in white_pieces:
+        color = PIECE_COLORS.get(piece_key, (200, 200, 200))
+        cv2.rectangle(legend, (x_offset, 38), (x_offset + 18, 56), color, -1)
+        cv2.putText(legend, piece_name, (x_offset + 24, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        x_offset += 110
+    
+    # Black pieces row
+    cv2.putText(legend, "BLACK:", (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+    black_pieces = [('black-pawn', 'Pawn'), ('black-rook', 'Rook'), ('black-knight', 'Knight'),
+                    ('black-bishop', 'Bishop'), ('black-queen', 'Queen'), ('black-king', 'King')]
+    x_offset = 100
+    for piece_key, piece_name in black_pieces:
+        color = PIECE_COLORS.get(piece_key, (200, 200, 200))
+        cv2.rectangle(legend, (x_offset, 68), (x_offset + 18, 86), color, -1)
+        cv2.putText(legend, piece_name, (x_offset + 24, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+        x_offset += 110
+    
+    # Combine
+    result = np.vstack([debug_img, legend])
+    return result
 
 
 def order_corners(points):
@@ -883,7 +1117,7 @@ def FEN_extract(pieces, board_corners, skip_validation: bool = False):
             fen_row += str(empty_count)
         fen_rows.append(fen_row)
     
-    return '/'.join(fen_rows)
+    return '/'.join(fen_rows), fen_positions  # Return both FEN and corrected grid
 
 
 @app.post("/detect_fen")
@@ -897,16 +1131,20 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
     """
     try:
         img_bytes = await file.read()
-        img = preprocess(img_bytes)
+        img_rgb = preprocess(img_bytes)
         
-        # Create debug image copy
-        debug_img = img.copy()
+        # Prepare images at different resolutions
+        img_pieces, p_scale, p_pad_left, p_pad_top = preprocess_for_pieces(img_rgb)
+        img_board, b_scale, b_pad_left, b_pad_top = preprocess_for_board(img_rgb)
+        
+        # Create debug image copy (from piece resolution)
+        debug_img = img_pieces.copy()
 
-        # Run piece detection (use ensemble if available)
+        # Run piece detection at high resolution (1280)
         pieces = []
         if USE_ENSEMBLE and ensemble_model:
             # Use confirmation ensemble
-            ensemble_preds = ensemble_model.predict(img, conf_threshold=0.25)
+            ensemble_preds = ensemble_model.predict(img_pieces, conf_threshold=0.25)
             for pred in ensemble_preds:
                 x1, y1, x2, y2 = map(int, pred['bbox'])
                 pieces.append({
@@ -920,7 +1158,7 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
         else:
             # Single model mode
-            results = model.predict(img, verbose=False, conf=0.25)
+            results = model.predict(img_pieces, verbose=False, conf=0.25)
             for result in results:
                 for box in result.boxes:
                     cls_id = int(box.cls[0])
@@ -936,8 +1174,8 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
                     cv2.putText(debug_img, f"{CLASSES[cls_id]}", (x1, y1 - 5), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
         
-        # Run board detection
-        board_results = board_model.predict(img, verbose=False)
+        # Run board detection at standard resolution (640)
+        board_results = board_model.predict(img_board, verbose=False)
 
         # Log confidence intervals
         if pieces:
@@ -947,7 +1185,7 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
         # Verify low-confidence pieces with secondary classifier
         verified_count = 0
         if piece_verifier and pieces:
-            pieces = piece_verifier.verify_detections(img, pieces)
+            pieces = piece_verifier.verify_detections(img_pieces, pieces)
             verified_count = sum(1 for p in pieces if 'verification' in p)
             if verified_count > 0:
                 print(f"[Classifier] Verified {verified_count} low-confidence pieces")
@@ -989,42 +1227,118 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
         if board_corners is not None:
             print(f"[Debug] 4 corners: {board_corners.tolist()}")
         
-        # Save debug image
-        debug_path = "debug_server_detection.jpg"
-        debug_img_bgr = cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(debug_path, debug_img_bgr)
-        print(f"[Debug] Saved to {debug_path}")
+        # Convert piece coordinates from PIECE_SIZE (1280) to BOARD_SIZE (640) accounting for letterbox offsets
+        # Formula: ((x - p_pad) / p_scale) * b_scale + b_pad
+        # Since both letterboxes are from same original, we can simplify:
+        # ((x - p_pad_left) * (b_scale / p_scale) + b_pad_left
+        pieces_scaled = []
+        for p in pieces:
+            x1, y1, x2, y2 = p['bbox']
+            # Convert each coordinate properly
+            new_x1 = int((x1 - p_pad_left) * (b_scale / p_scale) + b_pad_left)
+            new_y1 = int((y1 - p_pad_top) * (b_scale / p_scale) + b_pad_top)
+            new_x2 = int((x2 - p_pad_left) * (b_scale / p_scale) + b_pad_left)
+            new_y2 = int((y2 - p_pad_top) * (b_scale / p_scale) + b_pad_top)
+            pieces_scaled.append({
+                "class": p['class'],
+                "confidence": p['confidence'],
+                "bbox": [new_x1, new_y1, new_x2, new_y2]
+            })
+        
+        # Scale board corners from 640 to 1280 for debug visualization
+        board_corners_1280 = None
+        if board_corners is not None:
+            # Convert: ((corner - b_pad) / b_scale) * p_scale + p_pad
+            board_corners_1280 = np.zeros_like(board_corners)
+            for i, corner in enumerate(board_corners):
+                board_corners_1280[i, 0] = (corner[0] - b_pad_left) / b_scale * p_scale + p_pad_left
+                board_corners_1280[i, 1] = (corner[1] - b_pad_top) / b_scale * p_scale + p_pad_top
+        
+        # Save BEFORE debug image at 1280 resolution with raw piece detections
+        debug_before = draw_debug_image(img_pieces, pieces, board_corners_1280, 
+                                        f"DETECTION ({len(pieces)} pieces)")
+        debug_before_bgr = cv2.cvtColor(debug_before, cv2.COLOR_RGB2BGR)
+        cv2.imwrite("debug_1_detection.jpg", debug_before_bgr)
+        print(f"[Debug] Saved debug_1_detection.jpg")
         
         # Calculate confidence metrics FIRST to determine if verification needed
         avg_confidence = sum(p['confidence'] for p in pieces) / len(pieces) if pieces else 0
         min_confidence = min(p['confidence'] for p in pieces) if pieces else 0
         low_confidence_count = sum(1 for p in pieces if p['confidence'] < LOW_PIECE_THRESHOLD)
         
-        # Determine if verification is needed
-        needs_verification = (
-            avg_confidence < VERIFICATION_THRESHOLD or
-            low_confidence_count >= 2 or
-            min_confidence < 0.4
-        )
+        # Verification by second photo DISABLED for image mode
+        # Always return result directly with one photo
+        needs_verification = False
         
         # Extract FEN - ALWAYS apply validation (user can still take 2nd photo to improve, but FEN must be valid)
-        fen = FEN_extract(pieces, board_corners, skip_validation=False)
+        fen, corrected_grid = FEN_extract(pieces_scaled, board_corners, skip_validation=False)
         print(f"[FEN] {fen}")
         
-        # Generate session ID if verification needed
+        # Reconstruct corrected pieces from grid for AFTER debug image
+        # Map FEN chars back to piece class names
+        FEN_TO_CLASS = {
+            'P': 'white-pawn', 'R': 'white-rook', 'N': 'white-knight', 
+            'B': 'white-bishop', 'Q': 'white-queen', 'K': 'white-king',
+            'p': 'black-pawn', 'r': 'black-rook', 'n': 'black-knight', 
+            'b': 'black-bishop', 'q': 'black-queen', 'k': 'black-king'
+        }
+        
+        # Debug: show the corrected grid
+        print(f"[Debug AFTER] Corrected grid:")
+        for row_idx, row in enumerate(corrected_grid):
+            row_str = ''.join(cell if cell != '1' else '.' for cell in row)
+            print(f"  Row {row_idx}: {row_str}")
+        
+        # Create corrected pieces by updating original detections with corrected classes
+        # We need to map each original detection to its grid position, then get the corrected class
+        corrected_pieces = []
+        for p in pieces:
+            x1, y1, x2, y2 = p['bbox']
+            
+            # Find grid position for this piece (same logic as FEN_extract)
+            center_x = (x1 + x2) / 2
+            bottom_y = y2 - 5  # Use bottom of bbox
+            
+            # Scale to 640 coordinates for grid mapping
+            center_x_640 = (center_x - p_pad_left) * (b_scale / p_scale) + b_pad_left
+            bottom_y_640 = (bottom_y - p_pad_top) * (b_scale / p_scale) + b_pad_top
+            
+            # Map to grid using perspective transform (same as FEN_extract)
+            if board_corners is not None:
+                src_pts = board_corners.astype(np.float32)
+                dst_pts = np.array([
+                    [0, 0], [BOARD_SIZE, 0], [BOARD_SIZE, BOARD_SIZE], [0, BOARD_SIZE]
+                ], dtype=np.float32)
+                M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                pt = np.array([[[center_x_640, bottom_y_640]]], dtype=np.float32)
+                warped_pt = cv2.perspectiveTransform(pt, M)[0][0]
+                col = int(warped_pt[0] // (BOARD_SIZE / 8))
+                row = int(warped_pt[1] // (BOARD_SIZE / 8))
+                col = max(0, min(7, col))
+                row = max(0, min(7, row))
+                
+                # Get corrected piece at this position
+                corrected_char = corrected_grid[row][col]
+                if corrected_char != '1':
+                    corrected_class = FEN_TO_CLASS.get(corrected_char, p['class'])
+                    corrected_pieces.append({
+                        'class': corrected_class,
+                        'confidence': p['confidence'],
+                        'bbox': [x1, y1, x2, y2]  # Keep original bbox!
+                    })
+        
+        # Save AFTER debug with corrected pieces (same boxes, updated colors)
+        print(f"[Debug] Corrected pieces for after image: {len(corrected_pieces)}")
+        if corrected_pieces:
+            print(f"[Debug] Sample: {corrected_pieces[0]}")
+        debug_after = draw_debug_image(img_pieces, corrected_pieces, board_corners_1280,
+                                       f"AFTER Validation ({len(corrected_pieces)} pieces)")
+        debug_after_bgr = cv2.cvtColor(debug_after, cv2.COLOR_RGB2BGR)
+        cv2.imwrite("debug_2_after.jpg", debug_after_bgr)
+        print(f"[Debug] Saved debug_2_after.jpg")
+        
+        # Session ID not needed when verification is disabled
         session_id = None
-        if needs_verification:
-            # Extract grid positions for later merge
-            grid_positions = extract_grid_positions(pieces, board_corners)
-            session_id = str(uuid.uuid4())[:8]
-            verification_sessions[session_id] = {
-                'grid_positions': {str(k): v for k, v in grid_positions.items()},  # JSON-safe keys
-                'board_corners': board_corners.tolist() if board_corners is not None else None,
-                'fen': fen,
-                'timestamp': datetime.now(),
-                'turn': turn
-            }
-            print(f"[Verification] Session {session_id} created (avg_conf: {avg_confidence:.2f}, grid_pieces: {len(grid_positions)})")
         
         # Get best move from Lichess API
         best_move = get_best_move(fen, turn)
@@ -1042,9 +1356,9 @@ async def detect_fen(file: UploadFile, turn: str = Query(default="w", regex="^[w
             "pieces_verified": verified_count,
             "avg_confidence": round(avg_confidence, 3),
             "min_confidence": round(min_confidence, 3),
-            # Multi-photo verification
-            "needs_verification": needs_verification,
-            "session_id": session_id,
+            # Multi-photo verification (disabled)
+            "needs_verification": False,
+            "session_id": None,
             "low_confidence_pieces": low_confidence_count,
         }
 
@@ -1111,12 +1425,16 @@ async def detect_fen_verify(file: UploadFile, session_id: str = Query(...)):
     try:
         # Process second image
         img_bytes = await file.read()
-        img = preprocess(img_bytes)
+        img_rgb = preprocess(img_bytes)
         
-        # Run detection on second image
+        # Prepare images at different resolutions
+        img_pieces, p_scale, p_pad_left, p_pad_top = preprocess_for_pieces(img_rgb)
+        img_board, b_scale, b_pad_left, b_pad_top = preprocess_for_board(img_rgb)
+        
+        # Run detection on second image at high resolution
         pieces2 = []
         if USE_ENSEMBLE and ensemble_model:
-            ensemble_preds = ensemble_model.predict(img, conf_threshold=0.25)
+            ensemble_preds = ensemble_model.predict(img_pieces, conf_threshold=0.25)
             for pred in ensemble_preds:
                 x1, y1, x2, y2 = map(int, pred['bbox'])
                 pieces2.append({
@@ -1125,7 +1443,7 @@ async def detect_fen_verify(file: UploadFile, session_id: str = Query(...)):
                     "bbox": [x1, y1, x2, y2]
                 })
         else:
-            results = model.predict(img, verbose=False, conf=0.25)
+            results = model.predict(img_pieces, verbose=False, conf=0.25)
             for result in results:
                 for box in result.boxes:
                     cls_id = int(box.cls[0])
@@ -1139,8 +1457,8 @@ async def detect_fen_verify(file: UploadFile, session_id: str = Query(...)):
         
         print(f"[Verify] Image 2: {len(pieces2)} pieces detected")
         
-        # Get board corners from second image
-        board_results = board_model.predict(img, verbose=False)
+        # Get board corners from second image at standard resolution
+        board_results = board_model.predict(img_board, verbose=False)
         board_corners2 = extract_board_polygon(board_results)
         
         # Extract grid positions from second image
@@ -1364,8 +1682,8 @@ def detect_single_frame(img: np.ndarray) -> tuple:
     Returns:
         (pieces, board_corners) tuple
     """
-    # Resize to model input size
-    img_resized = cv2.resize(img, (INPUT_SIZE, INPUT_SIZE))
+    # Use letterbox resize to preserve aspect ratio
+    img_resized, scale, pad_left, pad_top = letterbox_resize(img, INPUT_SIZE)
     
     # Run detection
     pieces = []

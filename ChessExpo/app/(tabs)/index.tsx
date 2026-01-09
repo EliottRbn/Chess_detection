@@ -16,13 +16,15 @@ import * as ImagePicker from 'expo-image-picker';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { Chess, Move } from 'chess.js';
 
 import { ChessBoard2D } from '../../src/components/ChessBoard2D';
 import { BoardState, PieceType, createEmptyBoard } from '../../src/types';
 import { parseFEN } from '../../src/utils/fenParser';
 import { saveToHistory } from './history';
 
-const SERVER_URL = 'https://raphalp-chess-fen-detection.hf.space';
+//const SERVER_URL = 'https://raphalp-chess-fen-detection.hf.space';
+const SERVER_URL = 'http://localhost:7860';
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 // Piece images for selector
@@ -41,7 +43,7 @@ const PIECE_IMAGES: Record<string, any> = {
   'p': require('../../assets/pieces/black_pawn.png'),
 };
 
-type AppState = 'camera' | 'preview' | 'analyzing' | 'result' | 'verification_needed' | 'recording';
+type AppState = 'camera' | 'preview' | 'analyzing' | 'result' | 'verification_needed' | 'recording' | 'playing';
 type CaptureMode = 'photo' | 'video';
 
 export default function ChessAnalyzerScreen() {
@@ -73,6 +75,14 @@ export default function ChessAnalyzerScreen() {
   const [hasChanges, setHasChanges] = useState(false);  // Track if user modified pieces
   const [showPieceSelector, setShowPieceSelector] = useState(false);
   const [isRecalculating, setIsRecalculating] = useState(false);
+  const [showMoveHighlight, setShowMoveHighlight] = useState(false);  // Toggle best move visibility on board
+
+  // Game state
+  const chessInstance = useRef<Chess | null>(null);
+  const [legalMoves, setLegalMoves] = useState<string[]>([]);
+  const [promotionSquare, setPromotionSquare] = useState<{from: string, to: string} | null>(null);
+  const [showPromotionModal, setShowPromotionModal] = useState(false);
+  const [isGameOver, setIsGameOver] = useState(false);
 
   const takePhoto = async () => {
     if (!cameraRef.current) return;
@@ -250,39 +260,19 @@ export default function ChessAnalyzerScreen() {
       const data = await response.json();
 
       if (data.fen) {
-        // Check if verification is needed
-        if (data.needs_verification && data.session_id) {
-          setSessionId(data.session_id);
-          setConfidenceInfo({
-            avg: data.avg_confidence,
-            min: data.min_confidence,
-            lowCount: data.low_confidence_pieces || 0,
-          });
-          setVerificationReason(
-            data.avg_confidence < 0.75 
-              ? 'Confiance moyenne trop basse'
-              : `${data.low_confidence_pieces || 0} pièces incertaines`
-          );
-          // Store preliminary results
-          setBoardState(parseFEN(data.fen));
-          setFen(data.fen);
-          setBestMove(data.best_move || null);
-          setState('verification_needed');
-        } else {
-          // Good confidence - show result directly
-          const newBoardState = parseFEN(data.fen);
-          setBoardState(newBoardState);
-          setBestMove(data.best_move || null);
-          setFen(data.fen);
-          setState('result');
-          
-          // Save to history
-          saveToHistory({
-            fen: data.fen,
-            bestMove: data.best_move || null,
-            turn: turn as 'w' | 'b',
-          });
-        }
+        // Always go directly to result (no verification needed)
+        const newBoardState = parseFEN(data.fen);
+        setBoardState(newBoardState);
+        setBestMove(data.best_move || null);
+        setFen(data.fen);
+        setState('result');
+        
+        // Save to history
+        saveToHistory({
+          fen: data.fen,
+          bestMove: data.best_move || null,
+          turn: turn as 'w' | 'b',
+        });
       } else {
         throw new Error('Aucune position détectée');
       }
@@ -398,6 +388,9 @@ export default function ChessAnalyzerScreen() {
     setSelectedSquare(null);
     setHasChanges(false);
     setShowPieceSelector(false);
+    setShowMoveHighlight(false);
+    setShowMoveHighlight(false);
+    chessInstance.current = null;
     setState('camera');
   };
 
@@ -432,6 +425,152 @@ export default function ChessAnalyzerScreen() {
     // Update FEN string
     const newFen = boardToFEN(newBoard);
     setFen(newFen);
+  };
+
+  const startPlaying = () => {
+    try {
+      // Initialize chess instance with current FEN
+      // Defaulting castling/enpassant to allowed/none as we can't detect them from static image
+      // Standard: [placement] [turn] [castling] [enpassant] [halfmove] [fullmove]
+      // We start with full castling rights if kings/rooks are in place to allow play, or '-' if unsafe.
+      // For simplicity in "continue from image", we might default to no castling to avoid illegal move errors if rooks moved.
+      // Let's rely on simple FEN for now:
+      const safeFen = `${fen} ${isWhiteTurn ? 'w' : 'b'} - - 0 1`;
+      chessInstance.current = new Chess(safeFen);
+      
+      setState('playing');
+      setLegalMoves([]);
+      setShowMoveHighlight(false); // Don't show hint initially
+      setIsGameOver(false);
+    } catch (e) {
+      console.error('Error starting game:', e);
+      Alert.alert('Erreur', 'Impossible de démarrer la partie avec cette position');
+    }
+  };
+
+  const handleGameSquarePress = (square: string) => {
+    if (!chessInstance.current) return;
+    const chess = chessInstance.current;
+
+    // If we have a selected square (source), try to move
+    if (selectedSquare) {
+      // If tapped on same square, deselect
+      if (square === selectedSquare) {
+        setSelectedSquare(null);
+        setLegalMoves([]);
+        return;
+      }
+
+      // Check if move is legal
+      const moves = chess.moves({ verbose: true });
+      const move = moves.find(m => m.from === selectedSquare && m.to === square);
+
+      if (move) {
+        // Valid move found
+        if (move.flags.includes('p')) {
+          // Promotion needed
+          setPromotionSquare({ from: selectedSquare, to: square });
+          setShowPromotionModal(true);
+        } else {
+          makeMove({ from: selectedSquare, to: square });
+        }
+      } else {
+        // Not a valid move. 
+        // If tapped on own piece, switch selection
+        const piece = chess.get(square as any);
+        if (piece && piece.color === (chess.turn())) {
+          setSelectedSquare(square);
+          const newMoves = chess.moves({ square: square as any, verbose: true });
+          setLegalMoves(newMoves.map(m => m.to));
+        } else {
+          // Tapped empty or enemy square (invalid move) -> Deselect
+          setSelectedSquare(null);
+          setLegalMoves([]);
+        }
+      }
+    } else {
+      // No selection - try to select a piece
+      const piece = chess.get(square as any);
+      if (piece && piece.color === (chess.turn())) {
+        setSelectedSquare(square);
+        const moves = chess.moves({ square: square as any, verbose: true });
+        setLegalMoves(moves.map(m => m.to));
+      }
+    }
+  };
+
+  const makeMove = (move: { from: string, to: string, promotion?: string }) => {
+    if (!chessInstance.current) return;
+    const chess = chessInstance.current;
+
+    try {
+      const result = chess.move(move);
+      if (result) {
+        // Move successful
+        updateBoardFromChess();
+        setSelectedSquare(null);
+        setLegalMoves([]);
+        
+        // Check game over
+        if (chess.isGameOver()) {
+          setIsGameOver(true);
+          let reason = '';
+          if (chess.isCheckmate()) reason = 'Echec et mat !';
+          else if (chess.isDraw()) reason = 'Match nul !';
+          else if (chess.isStalemate()) reason = 'Pat !';
+          
+          Alert.alert('Fin de partie', reason);
+        } else {
+            // Trigger best move calculation for new position
+            calculateBestMove(chess.fen(), chess.turn());
+        }
+      }
+    } catch (e) {
+      console.error('Move error:', e);
+    }
+  };
+
+  const onPromotionSelect = (piece: string) => { // 'q', 'r', 'b', 'n'
+    if (promotionSquare) {
+      makeMove({ ...promotionSquare, promotion: piece });
+      setShowPromotionModal(false);
+      setPromotionSquare(null);
+    }
+  };
+
+  const calculateBestMove = async (currentFen: string, turn: string) => {
+    try {
+        const response = await fetch(
+          `${SERVER_URL}/calculate_move?fen=${encodeURIComponent(currentFen)}&turn=${turn}`,
+          { method: 'POST' }
+        );
+        if (response.ok) {
+            const data = await response.json();
+            setBestMove(data.best_move || null);
+        }
+    } catch (e) {
+        console.error("Best move calc error", e);
+    }
+  };
+
+  const updateBoardFromChess = () => {
+    if (!chessInstance.current) return;
+    const chess = chessInstance.current;
+    
+    // Convert chess.js board to our BoardState
+    // chess.board() returns 8x8 array of { type: 'p', color: 'w' } | null
+    const rawBoard = chess.board();
+    const newBoard: BoardState = rawBoard.map(row => 
+      row.map(cell => {
+        if (!cell) return null;
+        // Convert { type: 'p', color: 'w' } -> 'P' or 'p'
+        return cell.color === 'w' ? cell.type.toUpperCase() as PieceType : cell.type as PieceType;
+      })
+    );
+
+    setBoardState(newBoard);
+    setFen(chess.fen());
+    setIsWhiteTurn(chess.turn() === 'w');
   };
 
   const boardToFEN = (board: BoardState): string => {
@@ -724,7 +863,26 @@ export default function ChessAnalyzerScreen() {
         {/* Result */}
         {state === 'result' && (
           <ScrollView contentContainerStyle={styles.scrollContent}>
-            {/* Board - clickable before validation */}
+            {/* Lightbulb toggle - above board, right aligned */}
+            {showBestMove && bestMove && (
+              <View style={styles.boardHeader}>
+                <TouchableOpacity 
+                  style={[
+                    styles.lightbulbButton,
+                    showMoveHighlight && styles.lightbulbButtonActive
+                  ]}
+                  onPress={() => setShowMoveHighlight(!showMoveHighlight)}
+                >
+                  <Ionicons 
+                    name={showMoveHighlight ? "bulb" : "bulb-outline"} 
+                    size={24} 
+                    color={showMoveHighlight ? "#fff" : "#fbbf24"} 
+                  />
+                </TouchableOpacity>
+              </View>
+            )}
+
+            {/* Board */}
             <View style={styles.boardCard}>
               {!showBestMove ? (
                 // Editable mode - render clickable squares
@@ -740,35 +898,15 @@ export default function ChessAnalyzerScreen() {
                   </Text>
                 </View>
               ) : (
-                // Validated - show with best move highlight
+                // Validated - show board with best move highlight
                 <ChessBoard2D 
                   boardState={boardState} 
                   size={SCREEN_WIDTH - 60} 
-                  highlightFrom={moveData?.from}
-                  highlightTo={moveData?.to}
+                  highlightFrom={showMoveHighlight ? moveData?.from : undefined}
+                  highlightTo={showMoveHighlight ? moveData?.to : undefined}
                 />
               )}
             </View>
-
-            {/* Best move - only shown after validation */}
-            {showBestMove && (
-              bestMove ? (
-                <View style={styles.moveCard}>
-                  <View style={styles.moveHeader}>
-                    <Ionicons name="bulb" size={24} color="#fbbf24" />
-                    <Text style={styles.moveTitle}>Meilleur coup</Text>
-                  </View>
-                  <Text style={styles.moveText}>
-                    {moveData?.from?.toUpperCase()} → {moveData?.to?.toUpperCase()}
-                  </Text>
-                </View>
-              ) : (
-                <View style={styles.noMoveCard}>
-                  <Ionicons name="information-circle" size={20} color="#9ca3af" />
-                  <Text style={styles.noMoveText}>Aucun coup suggéré</Text>
-                </View>
-              )
-            )}
 
             {/* Validate button - before validation */}
             {!showBestMove && (
@@ -793,19 +931,18 @@ export default function ChessAnalyzerScreen() {
               </TouchableOpacity>
             )}
 
-            {/* FEN and New analysis - after validation */}
+            {/* Action buttons - after validation */}
             {showBestMove && (
-              <>
-                <View style={styles.fenCard}>
-                  <Text style={styles.fenLabel}>Position FEN</Text>
-                  <Text style={styles.fenText}>{fen}</Text>
-                </View>
-
-                <TouchableOpacity style={styles.primaryButton} onPress={reset}>
-                  <Ionicons name="camera" size={18} color="#fff" style={{ marginRight: 8 }} />
-                  <Text style={styles.primaryButtonText}>Nouvelle analyse</Text>
+              <View style={styles.buttonRow}>
+                <TouchableOpacity style={styles.secondaryButton} onPress={reset}>
+                  <Ionicons name="camera" size={18} color="#fff" style={{ marginRight: 6 }} />
+                  <Text style={styles.secondaryButtonText}>Nouvelle analyse</Text>
                 </TouchableOpacity>
-              </>
+                <TouchableOpacity style={styles.primaryButton} onPress={startPlaying}>
+                  <Ionicons name="play" size={18} color="#fff" style={{ marginRight: 6 }} />
+                  <Text style={styles.primaryButtonText}>Jouer la partie</Text>
+                </TouchableOpacity>
+              </View>
             )}
 
             {/* Piece Selector Modal */}
@@ -863,6 +1000,97 @@ export default function ChessAnalyzerScreen() {
                   <TouchableOpacity 
                     style={styles.cancelButton} 
                     onPress={() => { setShowPieceSelector(false); setSelectedSquare(null); }}
+                  >
+                    <Text style={styles.cancelButtonText}>Annuler</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+          </ScrollView>
+        )}
+
+        {/* Playing Mode */}
+        {state === 'playing' && (
+          <ScrollView contentContainerStyle={styles.scrollContent}>
+            {/* Header with abandon button and lightbulb */}
+            <View style={styles.playingHeader}>
+              <TouchableOpacity 
+                style={[styles.abandonButton, isGameOver && styles.finishButton]}
+                onPress={() => setState('result')}
+              >
+                <Ionicons name={isGameOver ? "checkmark-circle" : "flag"} size={18} color={isGameOver ? "#10b981" : "#ef4444"} />
+                <Text style={[styles.abandonButtonText, isGameOver && styles.finishButtonText]}>
+                  {isGameOver ? 'Terminer' : 'Abandonner'}
+                </Text>
+              </TouchableOpacity>
+              
+              {bestMove && (
+                <TouchableOpacity 
+                  style={[
+                    styles.lightbulbButton,
+                    showMoveHighlight && styles.lightbulbButtonActive
+                  ]}
+                  onPress={() => setShowMoveHighlight(!showMoveHighlight)}
+                >
+                  <Ionicons 
+                    name={showMoveHighlight ? "bulb" : "bulb-outline"} 
+                    size={24} 
+                    color={showMoveHighlight ? "#fff" : "#fbbf24"} 
+                  />
+                </TouchableOpacity>
+              )}
+            </View>
+
+            {/* Board - interactive for playing */}
+            <View style={styles.boardCard}>
+              <ChessBoard2D 
+                boardState={boardState} 
+                size={SCREEN_WIDTH - 60} 
+                highlightFrom={showMoveHighlight ? moveData?.from : undefined}
+                highlightTo={showMoveHighlight ? moveData?.to : undefined}
+                onSquarePress={handleGameSquarePress}
+                selectedSquare={selectedSquare}
+                flipBlackPieces={true}
+                legalMoves={legalMoves}
+              />
+            </View>
+
+            {/* Turn indicator */}
+            <View style={styles.turnIndicator}>
+              <Text style={styles.turnIndicatorText}>
+                {isWhiteTurn ? '♙ Blancs jouent' : '♟ Noirs jouent'}
+              </Text>
+            </View>
+
+            {/* Promotion Selection Modal */}
+            {showPromotionModal && promotionSquare && (
+              <View style={styles.pieceSelectorOverlay}>
+                <View style={styles.pieceSelector}>
+                  <Text style={styles.pieceSelectorTitle}>Promotion</Text>
+                  <Text style={styles.pieceSelectorSubtitle}>Choisissez une pièce</Text>
+                  
+                  <View style={styles.pieceRow}>
+                    {(['q', 'r', 'b', 'n'] as const).map(piece => {
+                      const displayPiece = isWhiteTurn ? piece.toUpperCase() : piece;
+                      return (
+                        <TouchableOpacity 
+                          key={piece} 
+                          style={styles.pieceButton}
+                          onPress={() => onPromotionSelect(piece)}
+                        >
+                          <Image 
+                            source={PIECE_IMAGES[displayPiece]} 
+                            style={styles.pieceImage} 
+                            resizeMode="contain"
+                          />
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                  
+                  <TouchableOpacity 
+                    style={styles.cancelButton} 
+                    onPress={() => { setShowPromotionModal(false); setPromotionSquare(null); }}
                   >
                     <Text style={styles.cancelButtonText}>Annuler</Text>
                   </TouchableOpacity>
@@ -996,12 +1224,76 @@ const styles = StyleSheet.create({
   analyzingSubtext: { color: '#9ca3af', fontSize: 14, marginTop: 8 },
 
   // Result
+  boardHeader: {
+    width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginBottom: 8,
+  },
   boardCard: {
     backgroundColor: 'rgba(255,255,255,0.05)',
     borderRadius: 16,
     padding: 10,
     marginBottom: 20,
     alignItems: 'center',
+  },
+  lightbulbButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(251,191,36,0.2)',
+    borderWidth: 2,
+    borderColor: '#fbbf24',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  lightbulbButtonActive: {
+    backgroundColor: '#f59e0b',
+    borderColor: '#f59e0b',
+  },
+  // Playing mode
+  playingHeader: {
+    width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  abandonButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    backgroundColor: 'rgba(239,68,68,0.15)',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(239,68,68,0.3)',
+  },
+  abandonButtonText: {
+    color: '#ef4444',
+    fontSize: 14,
+    fontWeight: '600',
+    marginLeft: 6,
+  },
+  finishButton: {
+    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+    borderColor: 'rgba(16, 185, 129, 0.3)',
+  },
+  finishButtonText: {
+    color: '#10b981',
+  },
+  turnIndicator: {
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  turnIndicatorText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '600',
   },
   moveCard: {
     backgroundColor: 'rgba(251,191,36,0.15)',
@@ -1172,7 +1464,14 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 18,
     fontWeight: '600',
-    marginBottom: 20,
+    marginBottom: 15,
+    textAlign: 'center',
+  },
+  pieceSelectorSubtitle: {
+    color: '#9ca3af',
+    fontSize: 14,
+    marginBottom: 15,
+    textAlign: 'center',
   },
   pieceOption: {
     backgroundColor: 'rgba(255,255,255,0.1)',
@@ -1197,9 +1496,10 @@ const styles = StyleSheet.create({
   },
   pieceRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'center',
-    gap: 8,
-    marginBottom: 15,
+    gap: 12,
+    marginBottom: 20,
   },
   pieceButton: {
     width: 44,
