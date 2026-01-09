@@ -17,6 +17,7 @@ models/*.bin
 # runs/
 # src/runs/
 !src/runs/best.pt
+!src/runs/detect_pieces_1.onnx
 !src/runs/chessboard_detection.pt
 
 # Logs & Debug
