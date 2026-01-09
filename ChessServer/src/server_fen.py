@@ -35,7 +35,7 @@ BOARD_MODEL_PATH = os.getenv("BOARD_MODEL_PATH")
 
 # Find primary piece detection model
 if not MODEL_PATH:
-    for path in ["src/runs/best.pt", "runs/best.pt", "models/detect_pieces_1.onnx", "src/runs/detect_pieces_1.onnx", "runs/detect_pieces_1.onnx"]:
+    for path in ["src/runs/best.pt", "runs/best.pt", "models/best.pt", "models/detect_pieces_1.onnx", "src/runs/detect_pieces_1.onnx", "runs/detect_pieces_1.onnx"]:
         if os.path.exists(path):
             MODEL_PATH = path
             break
