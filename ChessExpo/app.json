@@ -2,7 +2,7 @@
   "expo": {
     "name": "ChessCam 360",
     "slug": "chess-vision",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "chessvision",
@@ -29,6 +29,8 @@
       "predictiveBackGestureEnabled": false,
       "package": "com.gymbro.chessvision",
       "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO"
       ]
@@ -73,6 +75,12 @@
       "eas": {
         "projectId": "78dab50d-4881-4ba7-bbf1-cdb3b243ee72"
       }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/78dab50d-4881-4ba7-bbf1-cdb3b243ee72"
     }
   }
 }

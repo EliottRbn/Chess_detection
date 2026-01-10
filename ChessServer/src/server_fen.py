@@ -196,13 +196,17 @@ def get_best_move(fen, turn='w'):
             text=True
         )
         
-        # Send commands to Stockfish (depth 20 for better accuracy)
+        # Send commands to Stockfish (depth 30 for maximum accuracy)
+        # Higher depth = stronger play but slower response (~5-6 seconds)
         commands = f"""uci
+setoption name Threads value 4
+setoption name Hash value 256
+setoption name Skill Level value 20
 isready
 position fen {full_fen}
-go depth 20
+go depth 30
 """
-        stdout, stderr = process.communicate(input=commands, timeout=10)
+        stdout, stderr = process.communicate(input=commands, timeout=60)
         
         # Parse output for best move
         for line in stdout.split('\n'):
